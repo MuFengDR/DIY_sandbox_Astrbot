@@ -1,4 +1,4 @@
--- AstrBot Android 默认脚本 v0.1.8 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
+-- AstrBot Android 默认脚本 v0.1.9 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
 -- 独立 agent 模块 (opencode 引擎: 安装/启动/WebUI 托管), 界面在本文件编排
@@ -332,15 +332,21 @@ prepare_apt_downloads(){
     apt-get -o Acquire::ForceIPv4=true update
   fi
 }
+validate_linuxqq_deb(){
+  local file="$1" arch package
+  [ -s "$file" ] || return 1
+  dpkg-deb --info "$file" >/dev/null 2>&1 || return 1
+  dpkg-deb --contents "$file" >/dev/null 2>&1 || return 1
+  arch=$(dpkg-deb -f "$file" Architecture 2>/dev/null)
+  package=$(dpkg-deb -f "$file" Package 2>/dev/null)
+  case "$arch" in arm64|aarch64) ;; *) return 1 ;; esac
+  [ "$package" = "linuxqq" ]
+}
 use_local_linuxqq_deb(){
-  local dest="$1" candidate arch package
+  local dest="$1" candidate
   for candidate in "${ASTRBOT_LINUXQQ_FILE:-}" /sdcard/Download/*.deb /storage/emulated/0/Download/*.deb; do
     [ -n "$candidate" ] && [ -f "$candidate" ] || continue
-    dpkg-deb --info "$candidate" >/dev/null 2>&1 || continue
-    arch=$(dpkg-deb -f "$candidate" Architecture 2>/dev/null)
-    package=$(dpkg-deb -f "$candidate" Package 2>/dev/null)
-    case "$arch" in arm64|aarch64) ;; *) continue ;; esac
-    [ "$package" = "linuxqq" ] || continue
+    validate_linuxqq_deb "$candidate" || continue
     echo "发现本地 LinuxQQ 安装包: $candidate"
     cp -f "$candidate" "$dest"
     return $?
@@ -370,7 +376,7 @@ get_linuxqq_signed_url(){
   LINUXQQ_SIGNED_URL=$(grep -Eo '"url"[[:space:]]*:[[:space:]]*"[^"]+"' "$normalized_file" |
     head -n 1 | sed -E 's/^"url"[[:space:]]*:[[:space:]]*"//; s/"$//')
   case "$LINUXQQ_SIGNED_URL" in
-    https://*\?*sign=*\&t=*) return 0 ;;
+    https://*.deb|https://*.deb\?*) return 0 ;;
     *)
       echo "LinuxQQ 签名接口未返回有效下载地址"
       cat "$response_file" 2>/dev/null || true
@@ -385,11 +391,12 @@ install_linuxqq(){
   local config_file="$TMPDIR/linuxqq-config.js"
   local normalized_config="$TMPDIR/linuxqq-config-normalized.js"
   local qq_deb="$HOME/QQ.deb"
+  local qq_deb_part="${qq_deb}.part"
   local qq_url="${ASTRBOT_LINUXQQ_URL:-}"
   local package_arch package_name sound_package download_url
-  echo "[AstrBot Android] LinuxQQ 修复流程 v8"
+  echo "[AstrBot Android] LinuxQQ 修复流程 v9"
   progress_echo "LinuxQQ 安装中"
-  rm -f "$config_file" "$normalized_config"
+  rm -f "$config_file" "$normalized_config" "$qq_deb_part"
   if [ -z "$qq_url" ]; then
     echo "正在读取 LinuxQQ 官方发布配置..."
     if ! curl -fL --connect-timeout 15 --max-time 60 "$config_url" -o "$config_file"; then
@@ -405,25 +412,37 @@ install_linuxqq(){
     fi
     case "$qq_url" in //*) qq_url="https:$qq_url" ;; esac
   fi
-  package_arch=$(dpkg-deb -f "$qq_deb" Architecture 2>/dev/null)
-  package_name=$(dpkg-deb -f "$qq_deb" Package 2>/dev/null)
-  if dpkg-deb --info "$qq_deb" >/dev/null 2>&1 &&
-      { [ "$package_arch" = "arm64" ] || [ "$package_arch" = "aarch64" ]; } &&
-      [ "$package_name" = "linuxqq" ]; then
+  if validate_linuxqq_deb "$qq_deb"; then
     echo "复用上次已下载并校验通过的 LinuxQQ 安装包"
   else
-    rm -f "$qq_deb"
-    if get_linuxqq_signed_url "$qq_url"; then download_url="$LINUXQQ_SIGNED_URL"; else download_url=""; fi
+    if [ -f "$qq_deb" ]; then echo "发现不完整的 LinuxQQ 缓存，已清理并重新下载"; fi
+    rm -f "$qq_deb" "$qq_deb_part"
     echo "正在下载 LinuxQQ ARM64 安装包..."
-    if [ -z "$download_url" ] || ! curl -fL --connect-timeout 20 --max-time 600 \
+    download_url="$qq_url"
+    if ! curl -fL --connect-timeout 20 --max-time 600 \
         -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
-        -e 'https://im.qq.com/' "$download_url" -o "$qq_deb"; then
-      rm -f "$qq_deb"
-      if ! use_local_linuxqq_deb "$qq_deb"; then echo "LinuxQQ 签名下载失败"; return 1; fi
+        -e 'https://im.qq.com/' "$download_url" -o "$qq_deb_part"; then
+      rm -f "$qq_deb_part"
+      echo "LinuxQQ 官网直链下载失败，尝试申请兼容签名..."
+      if get_linuxqq_signed_url "$qq_url" && [ "$LINUXQQ_SIGNED_URL" != "$qq_url" ] &&
+          curl -fL --connect-timeout 20 --max-time 600 \
+            -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
+            -e 'https://im.qq.com/' "$LINUXQQ_SIGNED_URL" -o "$qq_deb_part"; then
+        :
+      else
+        rm -f "$qq_deb_part"
+        if ! use_local_linuxqq_deb "$qq_deb_part"; then echo "LinuxQQ 官网下载安装包失败"; return 1; fi
+      fi
+    fi
+    if ! validate_linuxqq_deb "$qq_deb_part"; then
+      echo "LinuxQQ 下载文件不完整或校验失败"; rm -f "$qq_deb_part"; return 1
+    fi
+    if ! mv -f "$qq_deb_part" "$qq_deb"; then
+      echo "保存 LinuxQQ 安装包失败"; rm -f "$qq_deb_part"; return 1
     fi
   fi
-  if ! dpkg-deb --info "$qq_deb" >/dev/null 2>&1; then
-    echo "LinuxQQ 下载文件不是有效的 deb 包"; rm -f "$qq_deb"; return 1
+  if ! validate_linuxqq_deb "$qq_deb"; then
+    echo "LinuxQQ 安装包完整性校验失败"; rm -f "$qq_deb"; return 1
   fi
   package_arch=$(dpkg-deb -f "$qq_deb" Architecture 2>/dev/null)
   package_name=$(dpkg-deb -f "$qq_deb" Package 2>/dev/null)
