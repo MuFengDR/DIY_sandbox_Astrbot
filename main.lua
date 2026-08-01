@@ -1,5 +1,7 @@
--- AstrBot Android 默认脚本 v0.1.9 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
+-- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
+
+local LUA_SCRIPT_VERSION = "0.1.0 beta5.4"
 
 -- 独立 agent 模块 (opencode 引擎: 安装/启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
@@ -752,13 +754,84 @@ function NC.find(list, id)
   for i, v in ipairs(list) do if v.id == id then return i, v end end
 end
 
--- 从 rootfs 里探测该实例已登录的 QQ (通过 onebot11_<qq>.json 文件名)
-function NC.detect_qq(id)
-  for _, e in ipairs(host.list_dir(nc_configdir(id))) do
-    local qq = tostring(e.name):match("^onebot11_(%d+)%.json$")
-    if qq then return qq end
+local function looks_like_qq(value)
+  local qq = tostring(value or ""):match("^%s*([1-9]%d+)%s*$")
+  return qq and #qq >= 5 and #qq <= 12 and qq or nil
+end
+
+local function qq_from_name(name)
+  name = tostring(name or "")
+  local lower = name:lower()
+  for _, prefix in ipairs({ "napcat_", "napcat_protocol_", "onebot11_" }) do
+    local qq = lower:match("^" .. prefix .. "([1-9]%d+)%.json$")
+    if looks_like_qq(qq) then return qq end
+  end
+  for _, key in ipairs({ "uin", "account", "user", "qq", "napcat", "onebot" }) do
+    local qq = lower:match(key .. "[_-]?([1-9]%d+)")
+    if looks_like_qq(qq) then return qq end
   end
   return nil
+end
+
+local function qq_from_config(text)
+  if type(text) ~= "string" then return nil end
+  local qq = text:match('"[Uu][Ii][Nn]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"self_[Uu][Ii][Nn]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"self[Uu][Ii][Nn]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"self_[Ii][Dd]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"self[Ii]d"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"user_[Ii][Dd]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"user[Ii]d"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"account[Uu][Ii][Nn]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"account"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('"[Qq][Qq]"%s*:%s*"?([1-9]%d+)"?') or
+    text:match('[Uu][Ii][Nn]%s*=%s*"?([1-9]%d+)"?') or
+    text:match('[Qq][Qq]%s*=%s*"?([1-9]%d+)"?')
+  return looks_like_qq(qq)
+end
+
+local function scan_qq_tree(root, budget)
+  if not host.exists(root) or budget.files >= 120 or budget.dirs >= 200 then return nil end
+  budget.dirs = budget.dirs + 1
+  for _, entry in ipairs(host.list_dir(root) or {}) do
+    local qq = qq_from_name(entry.name)
+    if qq then return qq end
+    local lower = tostring(entry.path or entry.name or ""):lower():gsub("\\", "/")
+    local entryName = tostring(entry.name or ""):lower()
+    local ignored = entryName == "log" or entryName == "logs" or entryName == "cache" or
+      entryName == "chat" or entryName == "message" or entryName == "messages" or
+      lower:find("/logs/", 1, true) or lower:find("/cache/", 1, true) or
+      lower:find("/chat/", 1, true) or lower:find("/messages/", 1, true)
+    if entry.isDir then
+      if not ignored then
+        qq = scan_qq_tree(entry.path, budget)
+        if qq then return qq end
+      end
+    elseif not ignored and budget.files < 120 and
+        (lower:match("%.json$") or lower:match("%.ini$") or lower:match("%.conf$") or lower:match("%.config$")) then
+      budget.files = budget.files + 1
+      qq = qq_from_config(host.read_file(entry.path))
+      if qq then return qq end
+    end
+  end
+  return nil
+end
+
+-- 与泡泡版一致：优先读 NapCat 的快速登录账号，再从实例登录态文件中识别 QQ。
+function NC.detect_qq(id)
+  local webui = host.read_file(nc_configdir(id) .. "/webui.json")
+  if webui then
+    local ok, cfg = pcall(json.decode, webui)
+    local qq = ok and type(cfg) == "table" and looks_like_qq(cfg.autoLoginAccount) or nil
+    if qq then return qq end
+  end
+  for _, entry in ipairs(host.list_dir(nc_configdir(id)) or {}) do
+    local qq = qq_from_name(entry.name)
+    if qq then return qq end
+  end
+  local budget = { files = 0, dirs = 0 }
+  return scan_qq_tree(nc_root() .. "/napcat_instances/" .. id .. "_home", budget) or
+    scan_qq_tree(nc_workdir(id), budget)
 end
 
 -- ---------- onebot 配置 ----------
@@ -915,15 +988,46 @@ function NC.unbind_adapter(ins)
   if changed then write_astrbot_config(cfg) end
 end
 
--- 绑定状态: "configured" 端口/token 一致 | "mismatch" 存在但不一致 |
---           "unbound" 无适配器 | "nocfg" AstrBot 未安装
+local function NC_ws_client(ins)
+  local qq = looks_like_qq(ins.qq) or NC.detect_qq(ins.id)
+  local paths = {}
+  if qq then paths[#paths + 1] = nc_configdir(ins.id) .. "/onebot11_" .. qq .. ".json" end
+  paths[#paths + 1] = nc_configdir(ins.id) .. "/onebot11.json"
+  local wanted = tostring(ins.boundWebSocketName or WS_NAME)
+  for _, path in ipairs(paths) do
+    local raw = host.read_file(path)
+    if raw then
+      local ok, cfg = pcall(json.decode, raw)
+      local network = ok and type(cfg) == "table" and cfg.network or nil
+      local clients = type(network) == "table" and network.websocketClients or nil
+      if type(clients) == "table" then
+        for _, client in ipairs(clients) do
+          if type(client) == "table" and tostring(client.name or "") == wanted then
+            return {
+              enabled = client.enable ~= false,
+              port = ws_port_of(client.url),
+              token = tostring(client.token or ""),
+            }
+          end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- 绑定状态: "configured" 两边已启用且端口/token 一致 | "disabled" 配置一致但至少一边已禁用 |
+--           "mismatch" 两边配置存在但端口/token 不一致 | "unbound" 任一边配置不存在 |
+--           "nocfg" AstrBot 未安装
 function NC.binding_state(ins)
   if not read_astrbot_config() then return "nocfg" end
-  local port = ins.oneBotPort or ONEBOT_FIRST
-  local token = ins.wsToken or ""
+  local client = NC_ws_client(ins)
+  if not client then return "unbound" end
   for _, a in ipairs(NC.list_adapters()) do
     if a.id == ins.boundAdapterId and ins.boundAdapterId ~= "" then
-      if a.enabled and a.port == port and token ~= "" and a.token == token then return "configured" end
+      if a.port == client.port and a.token == client.token then
+        return (a.enabled and client.enabled) and "configured" or "disabled"
+      end
       return "mismatch"
     end
   end
@@ -1011,6 +1115,46 @@ function NC.write_launcher(ins)
   host.write_file(nc_root() .. "/launcher_" .. ins.id .. ".sh", s)
 end
 
+-- 保留 NapCat 自己写入的 token 等字段，只同步端口与快速登录账号。
+function NC.patch_webui(ins)
+  local path = nc_configdir(ins.id) .. "/webui.json"
+  local raw = host.read_file(path)
+  if not raw then return false end
+  local ok, cfg = pcall(json.decode, raw)
+  if not ok or type(cfg) ~= "table" then return false end
+  cfg.port = ins.webUiPort
+  cfg.autoLoginAccount = ins.qq or ""
+  host.write_file(path, json.encode(cfg))
+  return true
+end
+
+-- 扫码成功后把 QQ 回写到实例存储；下次启动器会将其写入 autoLoginAccount。
+function NC.capture_login(id, notify)
+  local list = NC.load(); local _, ins = NC.find(list, id)
+  if not ins then return nil end
+  local saved = looks_like_qq(ins.qq)
+  if saved then return saved end
+  local qq = NC.detect_qq(id)
+  if not qq then return nil end
+  ins.qq = qq
+  ins.autoLogin = true
+  ins.qqAutoDetected = true
+  NC.save(list)
+  NC.patch_webui(ins)
+  NC.ensure_ws(ins)
+  NC.write_launcher(ins)
+  host.log("NapCat " .. (ins.name or id) .. " 已保存快速登录账号 " .. qq)
+  if notify then host.toast("已保存 QQ " .. qq .. "，下次可快速登录") end
+  return qq
+end
+
+function NC.schedule_qq_probe(id)
+  -- Lua 层拿不到泡泡版的终端登录事件，因此覆盖完整二维码有效期继续探测。
+  for _, delay in ipairs({ 3000, 10000, 30000, 60000, 90000, 120000 }) do
+    host.delay(delay, function() NC.capture_login(id, true) end)
+  end
+end
+
 -- ---------- 生命周期 ----------
 function NC.add(name)
   local list = NC.load()
@@ -1034,6 +1178,7 @@ function NC.add(name)
         id = "qq" .. idx .. "_" .. tostring(os.time()) .. tostring(math.random(1000, 9999)),
         name = nm, qq = "", webUiPort = webPort, display = display,
         oneBotPort = obPort, token = "", wsToken = gen_token(),
+        autoLogin = false, qqAutoDetected = false,
         boundWebSocketName = WS_NAME, boundAdapterId = "",
       }
       list[#list + 1] = ins
@@ -1065,14 +1210,18 @@ function NC.edit(id, name, webPort)
 end
 
 function NC.start(id)
+  -- 若脚本曾在扫码后重载，先从仍在磁盘上的登录态补一次账号识别。
+  NC.capture_login(id, false)
   local list = NC.load(); local _, ins = NC.find(list, id)
   if not ins then return end
   NC.ensure_ws(ins)
   NC.sync_adapter(ins)   -- 补绑: 若创建时 AstrBot 尚未安装, 此处补上适配器
+  NC.patch_webui(ins)
   NC.write_launcher(ins)
   local cmd = "echo [napcat] run launcher_" .. id .. ".sh; " ..
     "chmod +x /root/launcher_" .. id .. ".sh; bash /root/launcher_" .. id .. ".sh"
   host.spawn(cmd, ins.name or id, "napcat:" .. id)
+  if not looks_like_qq(ins.qq) then NC.schedule_qq_probe(id) end
   host.nav.go(2)
 end
 
@@ -1092,6 +1241,8 @@ end
 
 function NC.stop(id)
   host.stop("napcat:" .. id)
+  -- 停止前后登录态文件仍在，兜底保存错过定时探测的扫码账号。
+  NC.capture_login(id, false)
   local list = NC.load(); local _, ins = NC.find(list, id)
   host.exec(nc_cleanup_cmd(id, ins and ins.display or -1))
 end
@@ -1103,7 +1254,8 @@ function NC.logout(id)
   local list = NC.load(); local _, ins = NC.find(list, id)
   if ins then
     NC.unbind_adapter(ins)   -- 从 AstrBot 移除该账号的适配器
-    ins.qq = ""; ins.token = ""; ins.boundWebSocketName = ""; ins.boundAdapterId = ""
+    ins.qq = ""; ins.token = ""; ins.autoLogin = false; ins.qqAutoDetected = false
+    ins.boundWebSocketName = ""; ins.boundAdapterId = ""
     NC.save(list)
   end
 end
@@ -1218,6 +1370,7 @@ local function bind_bot_dialog(ins)
       local st = NC.binding_state(cur)
       local map = {
         configured = { "已绑定 · 端口/令牌一致", "green" },
+        disabled   = { "已禁用 · websocket 或 AstrBot 适配器开关未开启", "red" },
         mismatch   = { "适配器与账号端口/令牌不一致, 点下方重新对齐", "orange" },
         unbound    = { "AstrBot 中尚无该账号适配器, 点下方创建", "grey" },
         nocfg      = { "AstrBot 尚未安装 (启动后自动绑定)", "red" },
@@ -1368,8 +1521,551 @@ local function do_restore()
   })
 end
 
-local function manage_section()
+local DIAG_PREF = "astrbot_diagnostic_model_preference"
+local DIAG_TITLES = {
+  "应用状态", "后台运行权限", "运行环境检查", "AstrBot 和 NapCat 运行状态",
+  "NapCat 连接检查", "AstrBot 配置检查", "模型连通性测试",
+}
+local diag = { items = {}, configs = {}, cancelled = false, completed = false, request = nil, report = "" }
+
+local function diag_safe_error(err)
+  local s = tostring(err or "未知错误")
+  s = s:gsub("[Aa][Pp][Ii][_%-%s]?[Kk][Ee][Yy][^,;%s]*", "[敏感信息已隐藏]")
+  s = s:gsub("[Tt][Oo][Kk][Ee][Nn][^,;%s]*", "[敏感信息已隐藏]")
+  s = s:gsub("[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][^,;%s]*", "[敏感信息已隐藏]")
+  s = s:gsub("https?://[^%s]+", "[地址已隐藏]")
+  if #s > 180 then s = s:sub(1, 180) .. "…" end
+  return s
+end
+
+local function diag_b64url(data)
+  return host.base64_encode(data):gsub("%+", "-"):gsub("/", "_"):gsub("=", "")
+end
+
+local function diag_jwt(username, secret)
+  local header = diag_b64url(json.encode({ alg = "HS256", typ = "JWT" }))
+  local payload = diag_b64url(json.encode({ username = username, exp = os.time() + 600 }))
+  local unsigned = header .. "." .. payload
+  local signature = host.hmac_sha256(secret, unsigned, true)
+  return unsigned .. "." .. signature:gsub("%+", "-"):gsub("/", "_"):gsub("=", "")
+end
+
+local function diag_set(index, status, detail, rev)
+  diag.items[index].status = status
+  diag.items[index].detail = detail or ""
+  rev.set(rev.get() + 1)
+end
+
+local function diag_read_configs()
+  local root = host.ubuntu_path() .. "/root/AstrBot/data"
+  local paths = { { id = "default", name = "默认配置", path = root .. "/cmd_config.json" } }
+  for _, entry in ipairs(host.list_dir(root .. "/config") or {}) do
+    if not entry.isDir and entry.name:match("^abconf_.*%.json$") then
+      local id = entry.name:gsub("^abconf_", ""):gsub("%.json$", "")
+      paths[#paths + 1] = { id = id, name = id, path = entry.path }
+    end
+  end
+  local result = {}
+  for _, info in ipairs(paths) do
+    local raw = host.read_file(info.path)
+    if not raw or raw == "" then return nil, "找不到或无法读取 " .. info.path:match("[^/]+$") end
+    local ok, data = pcall(json.decode, raw)
+    if not ok or type(data) ~= "table" then return nil, info.path:match("[^/]+$") .. " 格式错误" end
+    info.data = data
+    result[#result + 1] = info
+  end
+  return result
+end
+
+local function diag_config_name(id)
+  return (diag.configNames and diag.configNames[id]) or (id == "default" and "default" or id)
+end
+
+local function diag_config_ids(adapterId)
+  local ids, seen = {}, {}
+  for umo, configId in pairs(diag.routes or {}) do
+    local platformId = tostring(umo):match("^([^:]*):")
+    if platformId == adapterId or platformId == "" or platformId == "*" then
+      configId = tostring(configId)
+      if not seen[configId] then ids[#ids + 1] = configId; seen[configId] = true end
+    end
+  end
+  if #ids == 0 then ids[1] = "default" end
+  return ids
+end
+
+local function diag_fetch_routing(done)
+  diag.configNames, diag.routes = { default = "default" }, {}
+  for _, cfg in ipairs(diag.allConfigs or {}) do
+    if cfg.id ~= "default" then diag.configNames[cfg.id] = cfg.name end
+  end
+  local defaultCfg
+  for _, cfg in ipairs(diag.allConfigs or {}) do if cfg.id == "default" then defaultCfg = cfg; break end end
+  local dashboard = defaultCfg and defaultCfg.data.dashboard
+  local username = type(dashboard) == "table" and tostring(dashboard.username or "") or ""
+  local secret = type(dashboard) == "table" and tostring(dashboard.jwt_secret or "") or ""
+  if username == "" or secret == "" then done(); return end
+  local token = diag_jwt(username, secret)
+  local base = "http://127.0.0.1:" .. ports.get("dashboard") .. "/api/config/"
+  local function get(path, cb)
+    diag.request = host.http({
+      url = base .. path, method = "GET", headers = { Authorization = "Bearer " .. token }, timeout = 10,
+      on_done = function(res)
+        diag.request = nil
+        local ok, body = pcall(json.decode, res and res.body or "")
+        cb(ok and type(body) == "table" and type(body.data) == "table" and body.data or {})
+      end,
+      on_error = function() diag.request = nil; cb({}) end,
+    })
+  end
+  get("abconfs", function(data)
+    if type(data.info_list) == "table" then
+      for _, info in ipairs(data.info_list) do
+        if type(info) == "table" and info.id then
+          local id, name = tostring(info.id), tostring(info.name or "")
+          diag.configNames[id] = name ~= "" and name or id
+        end
+      end
+    end
+    get("umo_abconf_routes", function(routeData)
+      if type(routeData.routing) == "table" then diag.routes = routeData.routing end
+      done()
+    end)
+  end)
+end
+
+local function diag_accounts(ctx)
+  local accounts = {}
+  for _, ins in ipairs(NC.load()) do
+    local qq = looks_like_qq(ins.qq)
+    if qq then
+      accounts[#accounts + 1] = {
+        instance = ins,
+        name = tostring(ins.name or "未命名账号"),
+        qq = qq,
+        running = ctx and ctx.running and ctx.running["napcat:" .. ins.id] == true,
+        bindingState = NC.binding_state(ins),
+      }
+    end
+  end
+  return accounts
+end
+
+local function diag_first_non_empty(first, second, third)
+  local values = { [1] = first, [2] = second, [3] = third }
+  for i = 1, 3 do
+    local value = values[i]
+    if type(value) == "string" then
+      if value:match("%S") then return value end
+    elseif type(value) == "table" then
+      if #value > 0 then return value end
+    elseif value ~= nil then
+      return value
+    end
+  end
+  return nil
+end
+
+local function diag_value(value)
+  if type(value) == "table" then
+    if #value == 0 then return "未配置" end
+    local values = {}
+    for _, entry in ipairs(value) do values[#values + 1] = tostring(entry) end
+    return table.concat(values, "、")
+  end
+  local text = tostring(value or "")
+  return text ~= "" and text or "未配置"
+end
+
+local function diag_switch(value)
+  if value == true then return "开" end
+  if value == false then return "关" end
+  return "未配置"
+end
+
+local function diag_wake_value(value)
+  if type(value) ~= "table" then return diag_value(value) end
+  local values = {}
+  for _, entry in ipairs(value) do
+    values[#values + 1] = '"' .. tostring(entry):gsub('"', '\\"') .. '"'
+  end
+  return "[" .. table.concat(values, "、") .. "]"
+end
+
+local function diag_plugin_names(pluginSet)
+  local configured = type(pluginSet) == "table" and pluginSet or { "*" }
+  local all = false
+  for _, name in ipairs(configured) do if tostring(name) == "*" then all = true; break end end
+  if not all then
+    local names = {}
+    for _, name in ipairs(configured) do names[#names + 1] = tostring(name) end
+    return names
+  end
+
+  local names = {}
+  local root = host.ubuntu_path() .. "/root/AstrBot/data/plugins"
+  for _, entry in ipairs(host.list_dir(root) or {}) do
+    if entry.isDir and tostring(entry.name):sub(1, 1) ~= "." then names[#names + 1] = tostring(entry.name) end
+  end
+  table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  return names
+end
+
+local function diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings)
+  local platform = type(cfg.data.platform_settings) == "table" and cfg.data.platform_settings or {}
+  local proactive = type(settings.proactive_capability) == "table" and settings.proactive_capability or {}
+  local active = type(settings.active_reply) == "table" and settings.active_reply or {}
+  local whitelist = type(active.whitelist) == "table" and active.whitelist or {}
+  local plugins = diag_plugin_names(cfg.data.plugin_set)
+  local defaultModel = defaultId ~= "" and (defaultId .. (defaultOk and "" or "（不可用）")) or "未配置"
+  local lines = {
+    "\t" .. diag_config_name(cfg.id) .. "：",
+    "\t\t模型：" .. enabled .. "/" .. #providers,
+    "\t\t默认模型：" .. defaultModel,
+    "\t\t管理员：" .. admins,
+    "\t\t唤醒词：" .. diag_wake_value(wake),
+    "\t\t额外唤醒词：" .. diag_value(settings.wake_prefix),
+    "\t\t电脑能力：",
+    "\t\t\t运行环境：" .. diag_value(settings.computer_use_runtime),
+    "\t\t\t需要管理员权限：" .. diag_switch(settings.computer_use_require_admin),
+    "\t\t主动型能力：" .. diag_switch(proactive.add_cron_tools),
+    "\t\t隔离会话：" .. diag_switch(platform.unique_session),
+    "\t\t主动回复：",
+    "\t\t\t开关：" .. diag_switch(active.enable),
+    "\t\t\t概率：" .. diag_value(active.possibility_reply),
+    "\t\t\t白名单数量：" .. #whitelist,
+    "\t\t插件列表：",
+  }
+  if #plugins == 0 then
+    lines[#lines + 1] = "\t\t\t（无）"
+  else
+    for _, name in ipairs(plugins) do lines[#lines + 1] = "\t\t\t" .. name end
+  end
+  return table.concat(lines, "\n")
+end
+
+local function diag_config_summary(configs)
+  local lines, reports, bad = {}, {}, false
+  for _, cfg in ipairs(configs) do
+    local providers = type(cfg.data.provider) == "table" and cfg.data.provider or {}
+    local settings = type(cfg.data.provider_settings) == "table" and cfg.data.provider_settings or {}
+    local defaultId = tostring(settings.default_provider_id or "")
+    local enabled, defaultOk = 0, false
+    for _, provider in ipairs(providers) do
+      if type(provider) == "table" and provider.enable ~= false then enabled = enabled + 1 end
+      if type(provider) == "table" and tostring(provider.id or "") == defaultId and provider.enable ~= false then defaultOk = true end
+    end
+    if defaultId == "" or not defaultOk then bad = true end
+    local admins = 0
+    for _, id in ipairs(type(cfg.data.admins_id) == "table" and cfg.data.admins_id or {}) do
+      if tostring(id) ~= "astrbot" then admins = admins + 1 end
+    end
+    local wake = diag_first_non_empty(cfg.data.wake_prefix, cfg.data.wake_prefixes, settings.wake_prefix) or "未配置"
+    local wakeDisplay = diag_value(wake)
+    lines[#lines + 1] = diag_config_name(cfg.id) .. "：模型 " .. enabled .. "/" .. #providers ..
+      "，默认模型 " .. (defaultId ~= "" and defaultId or "未配置") ..
+      ((defaultId ~= "" and not defaultOk) and "（不可用）" or "") .. "，管理员 " .. admins .. "，唤醒词 " .. tostring(wakeDisplay)
+    reports[#reports + 1] = diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings)
+  end
+  return table.concat(lines, "\n"), bad, table.concat(reports, "\n\n")
+end
+
+local function diag_make_report(skipped)
+  local marks = { pass = "[正常]", warn = "[注意]", fail = "[异常]", pending = "[未完成]", running = "[未完成]" }
+  local lines = { "AstrBot 诊断报告", "时间：" .. os.date("%Y-%m-%d %H:%M:%S"), "模型测试：" .. (skipped and "已跳过" or "已执行") }
+  for _, item in ipairs(diag.items) do
+    local mark = marks[item.status] or "[未完成]"
+    if item.reportDetail and item.reportDetail ~= "" then
+      lines[#lines + 1] = mark .. " " .. item.title .. "：" .. (item.reportSummary or "") .. "\n" .. item.reportDetail
+    else
+      lines[#lines + 1] = mark .. " " .. item.title .. (item.detail ~= "" and "：" .. item.detail or "")
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+local function diag_finish(skipped, rev)
+  diag.completed = true
+  diag.report = diag_make_report(skipped)
+  rev.set(rev.get() + 1)
+end
+
+local function diag_test_models(index, rev, done)
+  local defaultCfg
+  for _, cfg in ipairs(diag.allConfigs or {}) do if cfg.id == "default" then defaultCfg = cfg; break end end
+  local dashboard = defaultCfg and defaultCfg.data.dashboard
+  local username = type(dashboard) == "table" and tostring(dashboard.username or "") or ""
+  local secret = type(dashboard) == "table" and tostring(dashboard.jwt_secret or "") or ""
+  if username == "" or secret == "" then diag_set(7, "fail", "AstrBot 登录配置不完整", rev); done(); return end
+  local token = diag_jwt(username, secret)
+  local results, failed, indeterminate, tested = {}, false, false, 0
+  local function next_model()
+    if diag.cancelled then done(); return end
+    local cfg = diag.configs[index]
+    if not cfg then
+      diag_set(7, failed and "fail" or ((indeterminate or tested == 0) and "warn" or "pass"), table.concat(results, "\n"), rev)
+      done(); return
+    end
+    index = index + 1
+    local configName = diag_config_name(cfg.id)
+    local settings = type(cfg.data.provider_settings) == "table" and cfg.data.provider_settings or {}
+    local providerId = tostring(settings.default_provider_id or "")
+    if providerId == "" then failed = true; results[#results + 1] = configName .. "：未配置默认模型"; next_model(); return end
+    tested = tested + 1
+    diag.request = host.http({
+      url = "http://127.0.0.1:" .. ports.get("dashboard") .. "/api/config/provider/check_one?id=" .. host.url_encode(providerId, true),
+      method = "GET", headers = { Authorization = "Bearer " .. token }, timeout = 120,
+      on_done = function(res)
+        diag.request = nil
+        local ok, body = pcall(json.decode, res and res.body or "")
+        local data = ok and type(body) == "table" and body.data or nil
+        if res and res.status == 404 then
+          indeterminate = true
+          results[#results + 1] = configName .. "：当前 AstrBot 版本不支持自动测试"
+        elseif res and (res.status == 401 or res.status == 403) then
+          failed = true
+          results[#results + 1] = configName .. "：AstrBot 登录验证失败"
+        elseif res and res.ok and type(data) == "table" and data.status == "available" then
+          results[#results + 1] = configName .. "：" .. providerId .. " 连接正常"
+        else
+          failed = true
+          results[#results + 1] = configName .. "：" .. providerId .. " 连接失败" ..
+            (type(data) == "table" and data.error and "，" .. diag_safe_error(data.error) or "")
+        end
+        next_model()
+      end,
+      on_error = function(err)
+        diag.request = nil; failed = true
+        local msg = tostring(err or "")
+        results[#results + 1] = configName .. "：" .. providerId .. (msg:lower():find("timeout", 1, true) and " 测试超过 120 秒" or " 连接失败")
+        next_model()
+      end,
+    })
+  end
+  next_model()
+end
+
+local function diag_check_processes(ctx, rev)
+  local astr = ctx and ctx.running and ctx.running["astrbot"] == true
+  diag.accounts = diag_accounts(ctx)
+  local running = 0
+  for _, account in ipairs(diag.accounts) do if account.running then running = running + 1 end end
+  local napDetail
+  if #diag.accounts == 0 then napDetail = "NapCat 没有已登录账号"
+  elseif running == 0 then napDetail = "NapCat 未运行（0/" .. #diag.accounts .. "）"
+  else napDetail = "NapCat 运行正常（" .. running .. "/" .. #diag.accounts .. "）" end
+  local summary = "AstrBot " .. (astr and "运行正常" or "未运行") .. "；" .. napDetail
+  local report = { "\tAstrBot " .. ports.get("dashboard") .. " " .. (astr and "正常运行" or "未运行") }
+  for _, account in ipairs(diag.accounts) do
+    local ins = account.instance
+    report[#report + 1] = "\t" .. account.name .. " " .. account.qq .. " " ..
+      tostring(ins.webUiPort or "端口未配置") .. " " .. (account.running and "正常运行" or "未运行")
+  end
+  diag_set(4, astr and running > 0 and "pass" or "fail", summary, rev)
+  diag.items[4].reportSummary = summary .. "："
+  diag.items[4].reportDetail = table.concat(report, "\n")
+end
+
+local function diag_check_bindings(ctx, rev)
+  local astr = ctx and ctx.running and ctx.running["astrbot"] == true
+  local running, bad = 0, 0
+  for _, account in ipairs(diag.accounts or {}) do
+    if account.running then
+      running = running + 1
+      if account.bindingState ~= "configured" then bad = bad + 1 end
+    end
+  end
+  local passed = astr and running > 0 and bad == 0
+  local detail = passed and ("连接正常（" .. running .. " 个运行账号）") or
+    (running == 0 and "连接异常：没有已登录且正在运行的账号" or "连接异常：" .. bad .. " 个运行账号连接异常")
+  local report = { "\tAstrBot适配器：" }
+  local adapters = NC.list_adapters()
+  if #adapters == 0 then report[#report + 1] = "\t\t（无）" end
+  for _, adapter in ipairs(adapters) do
+    local configNames = {}
+    for _, id in ipairs(diag_config_ids(adapter.id)) do configNames[#configNames + 1] = diag_config_name(id) end
+    report[#report + 1] = "\t\t" .. adapter.id .. " " .. adapter.port .. " " ..
+      table.concat(configNames, "、") .. " " .. (adapter.enabled and "已启用" or "未启用")
+  end
+  report[#report + 1] = "\twebsocket适配器："
+  if #(diag.accounts or {}) == 0 then report[#report + 1] = "\t\t（无已登录账号）" end
+  for _, account in ipairs(diag.accounts or {}) do
+    local ins = account.instance
+    local labels = {
+      configured = "已绑定BOT", disabled = "已禁用BOT", mismatch = "BOT绑定异常",
+      unbound = "未绑定BOT", nocfg = "AstrBot未配置",
+    }
+    local state = not account.running and "未运行" or (labels[account.bindingState] or "连接异常")
+    report[#report + 1] = "\t\t" .. account.name .. " " .. account.qq .. " " ..
+      tostring(ins.oneBotPort or "端口未配置") .. " " .. state
+  end
+  diag_set(5, passed and "pass" or "fail", detail, rev)
+  diag.items[5].reportSummary = passed and "连接正常" or "连接异常"
+  diag.items[5].reportDetail = table.concat(report, "\n")
+end
+
+local function diag_select_active_configs()
+  local ids = {}
+  for _, account in ipairs(diag.accounts or {}) do
+    local adapterId = tostring(account.instance.boundAdapterId or "")
+    if account.running and adapterId ~= "" then
+      for _, id in ipairs(diag_config_ids(adapterId)) do ids[id] = true end
+    end
+  end
+  local selected, found = {}, {}
+  for _, cfg in ipairs(diag.allConfigs or {}) do
+    if ids[cfg.id] then selected[#selected + 1] = cfg; found[cfg.id] = true end
+  end
+  local missing = {}
+  for id in pairs(ids) do if not found[id] then missing[#missing + 1] = id end end
+  return selected, missing
+end
+
+local function diag_run(ctx, testModel, rev)
+  diag = { items = {}, configs = {}, allConfigs = {}, accounts = {}, configNames = {}, routes = {}, cancelled = false, completed = false, request = nil, report = "" }
+  for _, title in ipairs(DIAG_TITLES) do
+    diag.items[#diag.items + 1] = { title = title, status = "pending", detail = "", reportDetail = "" }
+  end
+  local step = 1
+  local function next_step()
+    if diag.cancelled then return end
+    if step > 7 then diag_finish(not testModel, rev); return end
+    diag_set(step, "running", "", rev)
+    if step == 1 then
+      diag_set(step, "pass", "沙盒版运行正常", rev)
+    elseif step == 2 then
+      diag_set(step, "warn", "请确认已允许应用在后台持续运行", rev)
+    elseif step == 3 then
+      local missing = {}
+      local checks = { { "base", "基础环境" }, { "uv", "uv" }, { "astrbot", "AstrBot" }, { "napcat", "NapCat" } }
+      for _, check in ipairs(checks) do if not env_installed(check[1]) then missing[#missing + 1] = check[2] end end
+      diag_set(step, #missing == 0 and "pass" or "fail", #missing == 0 and "所有环境均已安装" or "未安装完整：" .. table.concat(missing, "、"), rev)
+    elseif step == 4 then
+      diag_check_processes(ctx, rev)
+    elseif step == 5 then
+      local configs, err = diag_read_configs()
+      if not configs then
+        diag.configReadError = err
+        diag_check_bindings(ctx, rev)
+        step = 6; host.delay(50, next_step); return
+      end
+      diag.allConfigs = configs
+      diag_fetch_routing(function()
+        if diag.cancelled then return end
+        local ok, err = pcall(diag_check_bindings, ctx, rev)
+        if not ok then
+          diag_set(step, "fail", "连接检查失败：" .. diag_safe_error(err), rev)
+        end
+        step = 6; host.delay(50, next_step)
+      end)
+      return
+    elseif step == 6 then
+      local ok, err = pcall(function()
+        if diag.configReadError then diag_set(step, "fail", diag.configReadError, rev)
+        else
+          local configs, missing = diag_select_active_configs()
+          diag.configs = configs
+          local detail, bad, reportDetail = "", #configs == 0, ""
+          if #configs > 0 then detail, bad, reportDetail = diag_config_summary(configs) end
+          for _, id in ipairs(missing) do
+            local line = diag_config_name(id) .. "：配置文件不存在"
+            detail = detail ~= "" and (detail .. "\n" .. line) or line
+            reportDetail = reportDetail ~= "" and (reportDetail .. "\n\n\t" .. line) or ("\t" .. line)
+            bad = true
+          end
+          if detail == "" then
+            detail = "没有已运行账号可映射到配置文件"
+            reportDetail = "\t（没有已运行账号可映射到配置文件）"
+          end
+          diag_set(step, bad and "fail" or "pass", detail, rev)
+          diag.items[step].reportDetail = reportDetail
+        end
+      end)
+      if not ok then
+        local detail = "配置检查失败：" .. diag_safe_error(err)
+        diag_set(step, "fail", detail, rev)
+        diag.items[step].reportDetail = "\t" .. detail
+      end
+    elseif step == 7 then
+      if not testModel then diag_set(step, "warn", "已按你的选择跳过", rev)
+      elseif #diag.configs == 0 then diag_set(step, "fail", "没有已运行账号可测试模型", rev)
+      else diag_test_models(1, rev, function() step = 8; next_step() end); return end
+    end
+    step = step + 1
+    host.delay(50, next_step)
+  end
+  next_step()
+end
+
+local function diag_open_progress(ctx, testModel)
+  local rev = state("diagnostic.rev", 0); rev.get()
+  diag_run(ctx, testModel, rev)
+  host.dialog({
+    title = "AstrBot 自诊断",
+    build = function()
+      rev.get()
+      local rows = { text(diag.completed and "诊断完成" or "正在诊断", { size = 20, weight = "bold" }) }
+      local icons = { pending = "circle", pass = "check_circle", warn = "warning", fail = "error" }
+      local colors = { pending = "grey", running = "black", pass = "green", warn = "orange", fail = "red" }
+      for _, item in ipairs(diag.items) do
+        local marker = item.status == "running" and spinner({ size = 20 }) or icon(icons[item.status], { color = colors[item.status] })
+        rows[#rows + 1] = padding(row({
+          marker, spacer(12), expanded(column({ text(item.title), item.detail ~= "" and text(item.detail, { size = 12, color = "grey" }) or spacer(0) }, { gap = 3 })),
+        }, { cross = "center" }), { h = 8, v = 6 })
+      end
+      if diag.completed then
+        rows[#rows + 1] = row({
+          expanded(button("复制报告", function() host.clipboard.copy(diag.report); host.toast("报告已复制") end, { variant = "tonal" })),
+          expanded(button("导出报告", function()
+            local dir = host.backup_dir(); host.mkdirs(dir)
+            local path = dir .. "/AstrBot-diagnostic-" .. os.date("%Y%m%d-%H%M%S") .. ".txt"
+            host.write_file(path, diag.report)
+            host.toast("报告已导出到：\n" .. path)
+          end, { variant = "tonal" })),
+        }, { gap = 8 })
+      end
+      return box({ height = 520, child = scroll({ column(rows, { cross = "stretch", gap = 4 }) }) })
+    end,
+    actions = {
+      { label = "关闭", variant = "text", onTap = function()
+        diag.cancelled = true
+        if diag.request then host.http_cancel(diag.request); diag.request = nil end
+      end },
+    },
+  })
+end
+
+local function open_diagnostic_dialog(ctx)
+  local remembered = host.get(DIAG_PREF)
+  if remembered == "skip" or remembered == "agree" then diag_open_progress(ctx, remembered == "agree"); return end
+  local remember = false
+  host.dialog({
+    title = "开始自诊断",
+    build = function() return column({
+      text("将检查运行环境、后台权限、AstrBot、NapCat 和模型配置。模型测试会消耗少量 Token，单个模型最多等待 120 秒。"),
+      checkbox({ title = "下次不再提示", value = remember, onChanged = function(v) remember = v == true end }),
+    }, { gap = 12 }) end,
+    actions = {
+      { label = "取消", variant = "text" },
+      { label = "跳过模型测试", variant = "text", onTap = function()
+        if remember then host.set(DIAG_PREF, "skip") end
+        host.delay(100, function() diag_open_progress(ctx, false) end)
+      end },
+      { label = "同意并继续", variant = "filled", onTap = function()
+        if remember then host.set(DIAG_PREF, "agree") end
+        host.delay(100, function() diag_open_progress(ctx, true) end)
+      end },
+    },
+  })
+end
+
+local function manage_section(ctx)
   return expansion("AstrBot 管理", {
+    tile("自诊断", {
+      icon = "health_and_safety_outlined",
+      subtitle = "检查环境、进程、连接和各 AstrBot 配置",
+      trailing = button("开始", function() open_diagnostic_dialog(ctx) end, { variant = "tonal" }),
+    }),
     tile("覆盖安装插件依赖", {
       icon = "build_outlined", subtitle = "重新安装 AstrBot 并覆盖插件依赖",
       trailing = button("执行", function() step_astrbot(false, true) end, { variant = "tonal" }),
@@ -1406,7 +2102,10 @@ app.page("home", function(ctx)
     quick_start_card(ctx),
     napcat_card(ctx),
     env_card(),
-    manage_section(),
+    manage_section(ctx),
+    padding(text("泡泡 Lua v" .. LUA_SCRIPT_VERSION, {
+      size = 11, color = "grey", align = "center",
+    }), { v = 8 }),
   }
 end)
 
