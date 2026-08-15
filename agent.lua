@@ -1,77 +1,29 @@
--- agent.lua · opencode 引擎模块 (独立于界面, 可热更新)
--- 职责: opencode 二进制的安装/升级, 以及用 `opencode web` 一键启动 (自带 WebUI/自动免密/本机),
+-- agent.lua · OpenCode 引擎模块 (独立于界面, 可热更新)
+-- 职责: 通过共享安装器安装/升级 OpenCode，并用 `opencode web` 一键启动 (自带 WebUI/自动免密/本机),
 -- 就绪后在 WebView 标签打开其地址。界面编排在 main.lua; 本模块只暴露纯逻辑函数。
 -- API 详见 docs/lua_api.md
 
 local M = {}
+local installer = require("installer")
 
--- 与 opencode 二进制安装保持一致的版本 (仅用于安装/升级下载)
-local OPENCODE_VERSION = "1.17.18"
-M.version = OPENCODE_VERSION
+M.version = "由共享安装器管理"
+
+local function shell_quote(value)
+  return "'" .. tostring(value or ""):gsub("'", "'\"'\"'") .. "'"
+end
 
 local function bin_host() return host.ubuntu_path() .. "/root/.local/bin/opencode" end
 
 -- 是否已安装 opencode 二进制
 function M.installed() return host.exists(bin_host()) end
 
--- ==================== 安装 / 升级 ====================
--- 下载 opencode-linux-arm64 二进制到容器 ~/.local/bin (复用环境管理的 GitHub 代理设置)。
-local SH_OPENCODE = [==[
-ensure_tools(){
-  for c in curl tar; do
-    if ! command -v "$c" >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get -o Acquire::ForceIPv4=true update >/dev/null 2>&1 || true
-      apt-get -o Acquire::ForceIPv4=true install -y curl tar >/dev/null 2>&1 || true
-      break
-    fi
-  done
-}
-resolve_proxy(){
-  TARGET=""
-  if [ "$OPENCODE_GH_PROXY" = "direct" ]; then return; fi
-  if [ -n "$OPENCODE_GH_PROXY" ] && [ "$OPENCODE_GH_PROXY" != "auto" ]; then TARGET="$OPENCODE_GH_PROXY"; return; fi
-  local check="https://raw.githubusercontent.com/anomalyco/opencode/dev/README.md"
-  for p in "https://ghfast.top" "https://gh.wuliya.xin" "https://gh-proxy.com" "https://github.moeyy.xyz"; do
-    echo "测试代理: $p"
-    code=$(curl -k -L --connect-timeout 8 --max-time 16 -o /dev/null -s -w "%{http_code}" "${p}/${check}")
-    if [ "$code" = "200" ]; then TARGET="$p"; echo "使用代理: $p"; return; fi
-  done
-  echo "未找到可用代理, 尝试直连"
-}
-install_opencode(){
-  INSTALL_DIR="$HOME/.local/bin"
-  mkdir -p "$INSTALL_DIR"
-  ensure_tools
-  resolve_proxy
-  FILE="opencode-linux-arm64.tar.gz"
-  URL="${TARGET:+${TARGET}/}https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/${FILE}"
-  echo "下载 opencode v${OPENCODE_VERSION} ..."
-  TMP=$(mktemp -d 2>/dev/null || mktemp -t 'octmp.XXXXXX')
-  if ! curl -fL "$URL" -o "$TMP/$FILE"; then echo "下载失败: $URL"; rm -rf "$TMP"; exit 1; fi
-  echo "解压 ..."
-  if ! tar -xzf "$TMP/$FILE" -C "$TMP"; then echo "解压失败"; rm -rf "$TMP"; exit 1; fi
-  if [ ! -f "$TMP/opencode" ]; then echo "包内未找到 opencode 二进制"; rm -rf "$TMP"; exit 1; fi
-  mv "$TMP/opencode" "$INSTALL_DIR/opencode"
-  chmod 755 "$INSTALL_DIR/opencode"
-  grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null || echo 'export PATH=$HOME/.local/bin:$PATH' >> "$HOME/.bashrc"
-  rm -rf "$TMP"
-  echo "opencode 安装完成: $("$INSTALL_DIR/opencode" --version 2>/dev/null || echo '(版本未知)')"
-}
-]==]
-
--- reinstall: 是否覆盖重装 (升级同样走此路径)
+-- 安装与更新统一交由共享安装器实现，后续可无缝迁移为应用市场应用。
 function M.install(reinstall)
-  local pre = table.concat({
-    'export TMPDIR="' .. host.tmp_path() .. '"',
-    'export OPENCODE_VERSION="' .. OPENCODE_VERSION .. '"',
-    'export OPENCODE_GH_PROXY="' .. (host.get("environment_github_proxy") or "direct") .. '"',
-  }, "\n")
-  local body = "\ninstall_opencode\n"
-  if reinstall then
-    body = '\nrm -f "$HOME/.local/bin/opencode"\ninstall_opencode\n'
-  end
-  host.spawn(pre .. "\n" .. SH_OPENCODE .. body, "opencode 安装", "opencode_install")
+  installer.run("opencode", {
+    reinstall = reinstall == true,
+    title = "OpenCode 安装",
+    key = "opencode_install",
+  })
 end
 
 -- ==================== 运行 / 启动 ====================
@@ -166,11 +118,11 @@ function M.launch(target_dir, tab_name)
     local wd = target_dir or workdir()
     local cmd = table.concat({
       'export PATH="$HOME/.local/bin:$PATH"',
-      'mkdir -p "' .. wd .. '"',
+      'mkdir -p ' .. shell_quote(wd),
       -- opencode 启动后会尝试用 xdg-open 自动开浏览器; 容器内无桌面, 放个空桩避免报错
       'mkdir -p "$HOME/.local/bin"',
       'printf "#!/bin/sh\\nexit 0\\n" > "$HOME/.local/bin/xdg-open" && chmod +x "$HOME/.local/bin/xdg-open"',
-      "echo 'opencode 引擎启动 (127.0.0.1:" .. p .. "), 工作目录 " .. wd .. "'",
+      "echo " .. shell_quote("opencode 引擎启动 (127.0.0.1:" .. p .. "), 工作目录 " .. wd),
       "opencode web --hostname 127.0.0.1 --port " .. p,
     }, "\n")
     host.spawn(cmd, "opencode 引擎", "opencode_web", function()

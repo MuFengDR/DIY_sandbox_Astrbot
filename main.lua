@@ -1,10 +1,14 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0 beta5.4"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.5"
 
--- 独立 agent 模块 (opencode 引擎: 安装/启动/WebUI 托管), 界面在本文件编排
+-- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
+local installer = require("installer")
+local skin_updater = require("skin_updater")
+local ffi_ok, ffi = pcall(require, "ffi")
+if ffi_ok then pcall(ffi.cdef, "int access(const char *pathname, int mode);") end
 
 -- 端口管理: 纯 Lua, 基于通用设置存储 host.get/set (无 Dart 特定端口逻辑)
 local ports = {
@@ -26,7 +30,8 @@ nav.tabs({
 
 -- GitHub 代理: 直连 + 一组镜像, 由 Lua 端测速后择优 (下方 open_gh_dialog)
 local GH_PROXIES = {
-  { label = "直连 (GitHub 原始)", value = "direct" },
+  { label = "自动选择", value = "auto" },
+  { label = "直连", value = "direct" },
   { label = "Ghfast",     value = "https://ghfast.top" },
   { label = "Gh-Proxy",   value = "https://gh-proxy.com" },
   { label = "GhProxyNet", value = "https://ghproxy.net" },
@@ -40,10 +45,16 @@ local GH_PROXIES = {
   { label = "Nxnow",      value = "https://gh.nxnow.top" },
   { label = "Npee",       value = "https://down.npee.cn" },
 }
-local function gh_proxy() return host.get("environment_github_proxy") or "direct" end
+local function gh_proxy() return host.get("environment_github_proxy") or "auto" end
 local function gh_proxy_label(v)
   for _, p in ipairs(GH_PROXIES) do if p.value == v then return p.label end end
   return v
+end
+local function gh_selected_label()
+  local selected = gh_proxy()
+  if selected == "auto" then return "AUTO" end
+  if selected == "direct" then return "直连" end
+  return gh_proxy_label(selected)
 end
 
 -- 镜像测速 (纯 Lua 端): value -> { ms=数字 | err=字符串 | testing=true }
@@ -52,7 +63,7 @@ local GH_TEST_PATH = "/https://raw.githubusercontent.com/astral-sh/uv/main/READM
 local function gh_test_all()
   local rev = state("gh.speed.rev", 0)
   for _, p in ipairs(GH_PROXIES) do
-    if p.value ~= "direct" then
+    if p.value ~= "direct" and p.value ~= "auto" then
       gh_speed[p.value] = { testing = true }
       local t0 = host.now_ms()
       host.http({
@@ -88,6 +99,7 @@ local function gh_sorted()
 end
 local function gh_status_widget(p)
   if p.value == "direct" then return text("默认", { size = 12, color = "grey" }) end
+  if p.value == "auto" then return text("自动测速", { size = 12, color = "grey" }) end
   local s = gh_speed[p.value]
   if not s or s.testing then
     return row({ spinner({ size = 14 }), spacer(6), text("测速中", { size = 12, color = "grey" }) }, { cross = "center" })
@@ -105,7 +117,7 @@ local function open_gh_dialog()
     build = function()
       local rows = {
         row({
-          expanded(text("点选一个镜像作为下载代理", { size = 12, color = "grey" })),
+          expanded(text("当前选择节点：" .. gh_selected_label(), { size = 12, color = "grey" })),
           button("重新测速", gh_test_all, { variant = "text", icon = "refresh" }),
         }, { cross = "center" }),
         divider(),
@@ -165,6 +177,37 @@ local function env_installed(step)
   return false
 end
 
+local function installer_script_info()
+  local root = host.ubuntu_path() .. "/root"
+  local state_dir = root .. "/.astrbot-android/installer"
+  local runtime_script = state_dir .. "/current/astrbot-startup.sh"
+  local raw_version = host.read_file(state_dir .. "/version")
+  local version = raw_version and raw_version:match("^%s*(.-)%s*$") or nil
+
+  local executable = false
+  if ffi_ok and host.exists(runtime_script) then
+    local checked, result = pcall(function() return ffi.C.access(runtime_script, 1) == 0 end)
+    executable = checked and result
+  end
+  if version and version:match("^%d+%.%d+%.%d+$") and executable then
+    return { state = "valid", version = version }
+  end
+  if host.exists(root .. "/astrbot-startup.sh") then
+    return { state = "unknown" }
+  end
+  return { state = "missing" }
+end
+
+local function env_step_enabled(step, installed, script_ready)
+  if not script_ready then return false end
+  if step == "base" then return true end
+  if step == "uv" or step == "napcat" or step == "opencode" then
+    return installed.base == true
+  end
+  if step == "astrbot" then return installed.uv == true end
+  return false
+end
+
 local ENV_STEPS = {
   { id = "base",    title = "基础命令", sub = "sudo / git / curl" },
   { id = "uv",      title = "uv",       sub = "Python 依赖管理工具" },
@@ -174,504 +217,48 @@ local ENV_STEPS = {
 }
 
 -- ============================================================
--- 安装命令: 每个按钮直接下发自己那一步的命令 (无中央分发器)。
--- 共享的辅助函数 (progress/network/各 install_*) 作为 verbatim 常量复用,
--- 每个步骤按钮显式列出自己要执行的调用序列。
+-- 所有 Linux 安装步骤均通过同一份已签名的远端安装器运行。
+-- 此处只保留 UI 需要的参数与终端入口，安装实现不再复制到皮肤内。
 -- ============================================================
+local STEP_TITLES = {
+  base = "基础命令",
+  uv = "uv",
+  napcat = "NapCat",
+  astrbot = "AstrBot",
+  opencode = "OpenCode",
+}
 
--- 进容器执行时需要的环境变量前缀
-local function env_pre(force)
-  return table.concat({
-    'export TMPDIR="' .. host.tmp_path() .. '"',
-    'export ASTRBOT_DASHBOARD_PORT=' .. tostring(ports.get("dashboard")),
-    'export ASTRBOT_ONEBOT_WS_PORT=' .. tostring(ports.get("onebot")),
-    'export ASTRBOT_GITHUB_PROXY="' .. gh_proxy() .. '"',
-    'export ASTRBOT_FORCE_REINSTALL_STEP="' .. (force or "") .. '"',
-    'export L_NOT_INSTALLED=未安装',
-    'export L_INSTALLING=安装中',
-    'export L_INSTALLED=已安装',
-    'export UV_LINK_MODE=copy',
-    'export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"',
-    'export UV_PYTHON_INSTALL_MIRROR="' ..
-      gh_prefix("https://github.com/astral-sh/python-build-standalone/releases/download") .. '"',
-  }, "\n")
+local function run_installer_step(step, reinstall, reinstall_plugins)
+  if installer_script_info().state ~= "valid" then
+    host.toast("请先下载或更新脚本")
+    return false
+  end
+  installer.run(step, {
+    reinstall = reinstall == true,
+    reinstall_plugins = reinstall_plugins == true,
+    dashboard_port = ports.get("dashboard"),
+    onebot_ws_port = ports.get("onebot"),
+    title = STEP_TITLES[step] or "安装脚本",
+    key = "installer-" .. step,
+  })
+  host.nav.go(2)
+  return true
 end
 
--- 共享辅助 (verbatim)
-local SH_HELPERS = [==[
-progress_echo(){
-  echo -e "\033[31m- $@\033[0m"
-  echo "$@" > "$TMPDIR/progress_des"
-}
-prepare_reinstall_step(){
-  case "$1" in
-    uv)
-      progress_echo "uv 重装准备中"
-      rm -f "$HOME/.local/bin/uv" "$HOME/.local/bin/uvx"
-      ;;
-    napcat)
-      progress_echo "NapCat 重装准备中"
-      if [ -d "$HOME/napcat/config" ]; then
-        rm -rf "$HOME/napcat_config_backup"
-        cp -r "$HOME/napcat/config" "$HOME/napcat_config_backup"
-      fi
-      pkill -f 'qq --no-sandbox' 2>/dev/null || true
-      pkill -f 'NapCat' 2>/dev/null || true
-      pkill -f 'napcat' 2>/dev/null || true
-      rm -rf "$HOME/napcat" "$HOME/napcat.sh" "$HOME/launcher.sh"
-      ;;
-    astrbot)
-      progress_echo "AstrBot 重装准备中"
-      killall uv 2>/dev/null || true
-      rm -rf "$HOME/AstrBot_data_reinstall_backup"
-      if [ -d "$HOME/AstrBot/data" ]; then
-        cp -r "$HOME/AstrBot/data" "$HOME/AstrBot_data_reinstall_backup"
-      fi
-      rm -rf "$HOME/AstrBot" "$HOME/AstrBot_tmp"
-      ;;
-  esac
-}
-maybe_prepare_reinstall(){
-  if [ "$ASTRBOT_FORCE_REINSTALL_STEP" = "$1" ]; then
-    prepare_reinstall_step "$1"
-  fi
-}
-]==]
-
-local SH_NET = [==[
-network_test() {
-  target_proxy=""
-  case "$ASTRBOT_GITHUB_PROXY" in
-    ""|direct|auto) echo "Github 直连"; return 0 ;;
-    *) target_proxy="$ASTRBOT_GITHUB_PROXY"; echo "使用代理: $target_proxy"; return 0 ;;
-  esac
-}
-]==]
-
-local SH_BASE = [==[
-install_sudo_curl_git(){
-  missing=()
-  for cmd in sudo git curl; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then missing+=("$cmd"); fi
-  done
-  if [ ${#missing[@]} -eq 0 ]; then progress_echo "基础命令已安装"; return 0; fi
-  progress_echo "基础命令缺失: ${missing[*]}, 开始安装..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt_opts="-o Acquire::ForceIPv4=true"
-  if ! apt-get $apt_opts update; then echo "apt-get update 失败，继续尝试安装..."; fi
-  if ! apt-get $apt_opts install -y sudo git curl; then echo "基础命令安装失败"; return 1; fi
-  for cmd in sudo git curl; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then echo "基础命令安装后仍缺少: $cmd"; return 1; fi
-  done
-  progress_echo "基础命令安装完成"
-}
-]==]
-
-local SH_UV = [==[
-install_uv(){
-  INSTALL_DIR="$HOME/.local/bin"
-  ARCHIVE_FILE="uv-aarch64-unknown-linux-gnu.tar.gz"
-  mkdir -p "$INSTALL_DIR"
-  network_test
-
-  # 探测最新版本: 走 releases/latest 的 302 重定向, 取最终 URL 末段 tag (无需 api.github.com)
-  progress_echo "检测 uv 最新版本..."
-  LATEST_URL=$(curl -fsSL -o /dev/null -w '%{url_effective}' "${target_proxy:+${target_proxy}/}https://github.com/astral-sh/uv/releases/latest" 2>/dev/null)
-  APP_VERSION="${LATEST_URL##*/}"
-  case "$APP_VERSION" in
-    ""|*latest*) APP_VERSION="0.9.9"; echo "无法获取最新版本, 回退到 $APP_VERSION" ;;
-    *) echo "最新 uv 版本: $APP_VERSION" ;;
-  esac
-
-  # 已安装同版本 -> 跳过 (重装时按钮已在 prepare_reinstall_step 删除旧二进制)
-  if [ -x "$INSTALL_DIR/uv" ]; then
-    CUR=$("$INSTALL_DIR/uv" --version 2>/dev/null | awk '{print $2}')
-    if [ -n "$CUR" ] && [ "$CUR" = "$APP_VERSION" ]; then
-      progress_echo "uv 已是最新 ($CUR)"
-      return 0
-    fi
-    echo "当前 uv ${CUR:-未知}, 将更新到 $APP_VERSION..."
-  fi
-
-  progress_echo "uv $L_INSTALLING ($APP_VERSION)..."
-  DOWNLOAD_URL="${target_proxy:+${target_proxy}/}https://github.com/astral-sh/uv/releases/download/${APP_VERSION}/${ARCHIVE_FILE}"
-  TMP_DIR=$(mktemp -d)
-  echo "正在下载 uv $APP_VERSION..."
-  if ! curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_FILE"; then echo "下载失败"; rm -rf "$TMP_DIR"; exit 1; fi
-  if ! tar -C "$TMP_DIR" -xf "$TMP_DIR/$ARCHIVE_FILE" --strip-components 1; then echo "解压失败"; rm -rf "$TMP_DIR"; exit 1; fi
-  cp "$TMP_DIR/uv" "$TMP_DIR/uvx" "$INSTALL_DIR/" && chmod +x "$INSTALL_DIR/uv" "$INSTALL_DIR/uvx"
-  grep -q "$INSTALL_DIR" "$HOME/.bashrc" 2>/dev/null || echo "export PATH=$INSTALL_DIR:\$PATH" >> "$HOME/.bashrc"
-  rm -rf "$TMP_DIR"
-  progress_echo "uv 安装完成 ($APP_VERSION)"
-}
-]==]
-
-local SH_NAPCAT = [==[
-configure_napcat_token_ttl(){
-  if [ -f "$HOME/napcat/napcat.mjs" ]; then
-    sed -i -E "s#static MAX_CREDENTIAL_VALID_SECONDS = [0-9]+#static MAX_CREDENTIAL_VALID_SECONDS = 604800#g" "$HOME/napcat/napcat.mjs"
-    sed -i -E 's#Rp\.set\(`revoked:\$\{r\}`, !0, [0-9]+\)#Rp.set(`revoked:${r}`, !0, 604800)#g' "$HOME/napcat/napcat.mjs"
-  fi
-}
-linuxqq_ready(){
-  command -v qq >/dev/null 2>&1 &&
-    dpkg-query -W -f='${Status}\n' linuxqq 2>/dev/null | grep -qx 'install ok installed'
-}
-prepare_apt_downloads(){
-  local file changed=0
-  export DEBIAN_FRONTEND=noninteractive
-  mkdir -p /etc/apt/apt.conf.d
-  printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\n' > /etc/apt/apt.conf.d/99astrbot-force-ipv4
-  for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    [ -f "$file" ] || continue
-    if grep -q 'http://mirrors\.tuna\.tsinghua\.edu\.cn' "$file"; then
-      sed -i 's#http://mirrors\.tuna\.tsinghua\.edu\.cn#https://mirrors.tuna.tsinghua.edu.cn#g' "$file"
-      changed=1
-    fi
-  done
-  if [ "$changed" -eq 1 ]; then
-    echo "已将 Ubuntu 清华软件源切换为 HTTPS，正在刷新索引..."
-    apt-get -o Acquire::ForceIPv4=true update
-  fi
-}
-validate_linuxqq_deb(){
-  local file="$1" arch package
-  [ -s "$file" ] || return 1
-  dpkg-deb --info "$file" >/dev/null 2>&1 || return 1
-  dpkg-deb --contents "$file" >/dev/null 2>&1 || return 1
-  arch=$(dpkg-deb -f "$file" Architecture 2>/dev/null)
-  package=$(dpkg-deb -f "$file" Package 2>/dev/null)
-  case "$arch" in arm64|aarch64) ;; *) return 1 ;; esac
-  [ "$package" = "linuxqq" ]
-}
-use_local_linuxqq_deb(){
-  local dest="$1" candidate
-  for candidate in "${ASTRBOT_LINUXQQ_FILE:-}" /sdcard/Download/*.deb /storage/emulated/0/Download/*.deb; do
-    [ -n "$candidate" ] && [ -f "$candidate" ] || continue
-    validate_linuxqq_deb "$candidate" || continue
-    echo "发现本地 LinuxQQ 安装包: $candidate"
-    cp -f "$candidate" "$dest"
-    return $?
-  done
-  return 1
-}
-get_linuxqq_signed_url(){
-  local bare_url="$1"
-  local api_url="https://im.qq.com/http2rpc/gotrpc/noauth/trpc.qqntv2.urlsign.UrlSign/GetSign"
-  local response_file="$TMPDIR/linuxqq-sign.json"
-  local normalized_file="$TMPDIR/linuxqq-sign-normalized.json"
-  local payload
-  LINUXQQ_SIGNED_URL=""
-  payload=$(printf '{"url":"%s"}' "$bare_url")
-  echo "正在向 LinuxQQ 官网申请临时下载签名..."
-  if ! curl -fL --connect-timeout 15 --max-time 30 \
-      -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
-      -e 'https://im.qq.com/' \
-      -H 'Accept: application/json, text/plain, */*' \
-      -H 'Content-Type: application/json' \
-      -H 'x-oidb: {"uint32_command":"0x9b8e","uint32_service_type":1}' \
-      --data "$payload" "$api_url" -o "$response_file"; then
-    echo "获取 LinuxQQ 临时下载签名失败"
-    return 1
-  fi
-  sed 's#\\/#/#g; s#\\u0026#\&#g; s#\\u003d#=#g' "$response_file" > "$normalized_file"
-  LINUXQQ_SIGNED_URL=$(grep -Eo '"url"[[:space:]]*:[[:space:]]*"[^"]+"' "$normalized_file" |
-    head -n 1 | sed -E 's/^"url"[[:space:]]*:[[:space:]]*"//; s/"$//')
-  case "$LINUXQQ_SIGNED_URL" in
-    https://*.deb|https://*.deb\?*) return 0 ;;
-    *)
-      echo "LinuxQQ 签名接口未返回有效下载地址"
-      cat "$response_file" 2>/dev/null || true
-      LINUXQQ_SIGNED_URL=""
-      return 1
-      ;;
-  esac
-}
-install_linuxqq(){
-  if linuxqq_ready; then echo "LinuxQQ 已安装"; return 0; fi
-  local config_url="${ASTRBOT_LINUXQQ_CONFIG_URL:-https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js}"
-  local config_file="$TMPDIR/linuxqq-config.js"
-  local normalized_config="$TMPDIR/linuxqq-config-normalized.js"
-  local qq_deb="$HOME/QQ.deb"
-  local qq_deb_part="${qq_deb}.part"
-  local qq_url="${ASTRBOT_LINUXQQ_URL:-}"
-  local package_arch package_name sound_package download_url
-  echo "[AstrBot Android] LinuxQQ 修复流程 v9"
-  progress_echo "LinuxQQ 安装中"
-  rm -f "$config_file" "$normalized_config" "$qq_deb_part"
-  if [ -z "$qq_url" ]; then
-    echo "正在读取 LinuxQQ 官方发布配置..."
-    if ! curl -fL --connect-timeout 15 --max-time 60 "$config_url" -o "$config_file"; then
-      echo "获取 LinuxQQ 官方发布配置失败: $config_url"; return 1
-    fi
-    sed 's#\\/#/#g' "$config_file" > "$normalized_config"
-    qq_url=$(grep -Eo "(https?:)?//[^\"'[:space:]]+" "$normalized_config" |
-      grep -Ei '(arm64|aarch64)[^[:space:]]*\.deb([?#][^[:space:]]*)?' | head -n 1)
-    if [ -z "$qq_url" ]; then
-      echo "官方发布配置中未找到 ARM64 LinuxQQ deb 下载地址"
-      echo "可临时通过 ASTRBOT_LINUXQQ_URL 指定可信的 ARM64 deb 地址后重试"
-      return 1
-    fi
-    case "$qq_url" in //*) qq_url="https:$qq_url" ;; esac
-  fi
-  if validate_linuxqq_deb "$qq_deb"; then
-    echo "复用上次已下载并校验通过的 LinuxQQ 安装包"
-  else
-    if [ -f "$qq_deb" ]; then echo "发现不完整的 LinuxQQ 缓存，已清理并重新下载"; fi
-    rm -f "$qq_deb" "$qq_deb_part"
-    echo "正在下载 LinuxQQ ARM64 安装包..."
-    download_url="$qq_url"
-    if ! curl -fL --connect-timeout 20 --max-time 600 \
-        -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
-        -e 'https://im.qq.com/' "$download_url" -o "$qq_deb_part"; then
-      rm -f "$qq_deb_part"
-      echo "LinuxQQ 官网直链下载失败，尝试申请兼容签名..."
-      if get_linuxqq_signed_url "$qq_url" && [ "$LINUXQQ_SIGNED_URL" != "$qq_url" ] &&
-          curl -fL --connect-timeout 20 --max-time 600 \
-            -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
-            -e 'https://im.qq.com/' "$LINUXQQ_SIGNED_URL" -o "$qq_deb_part"; then
-        :
-      else
-        rm -f "$qq_deb_part"
-        if ! use_local_linuxqq_deb "$qq_deb_part"; then echo "LinuxQQ 官网下载安装包失败"; return 1; fi
-      fi
-    fi
-    if ! validate_linuxqq_deb "$qq_deb_part"; then
-      echo "LinuxQQ 下载文件不完整或校验失败"; rm -f "$qq_deb_part"; return 1
-    fi
-    if ! mv -f "$qq_deb_part" "$qq_deb"; then
-      echo "保存 LinuxQQ 安装包失败"; rm -f "$qq_deb_part"; return 1
-    fi
-  fi
-  if ! validate_linuxqq_deb "$qq_deb"; then
-    echo "LinuxQQ 安装包完整性校验失败"; rm -f "$qq_deb"; return 1
-  fi
-  package_arch=$(dpkg-deb -f "$qq_deb" Architecture 2>/dev/null)
-  package_name=$(dpkg-deb -f "$qq_deb" Package 2>/dev/null)
-  case "$package_arch" in arm64|aarch64) ;; *)
-    echo "LinuxQQ 安装包架构不匹配: ${package_arch:-未知} (需要 arm64)"; rm -f "$qq_deb"; return 1 ;;
-  esac
-  if [ "$package_name" != "linuxqq" ]; then
-    echo "LinuxQQ 安装包名称异常: ${package_name:-未知}"; rm -f "$qq_deb"; return 1
-  fi
-  if apt-cache show libasound2t64 >/dev/null 2>&1; then sound_package=libasound2t64; else sound_package=libasound2; fi
-  if ! apt-get install -y libnss3 libgbm1 "$sound_package"; then echo "LinuxQQ 运行依赖安装失败"; return 1; fi
-  if ! apt-get install -y "$qq_deb"; then echo "LinuxQQ deb 安装失败"; return 1; fi
-  if ! linuxqq_ready; then echo "LinuxQQ 安装后的命令/包状态验收失败"; return 1; fi
-  rm -f "$config_file" "$normalized_config" "$qq_deb"
-  progress_echo "LinuxQQ 安装完成"
-}
-patch_napcat_installer(){
-  local installer="$1"
-  sed -i -E 's/curl[[:space:]]+-k[[:space:]]+-L/curl -fL/g; s/curl[[:space:]]+-kL/curl -fL/g' "$installer"
-  if apt-cache show libasound2t64 >/dev/null 2>&1; then
-    sed -i -E 's/(^|[^[:alnum:]_])libasound2([^[:alnum:]_]|$)/\1libasound2t64\2/g' "$installer"
-  fi
-  sed -i -E 's/^[[:space:]]*install_linuxqq[[:space:]]*$/log "LinuxQQ 已由 AstrBot Android 安装，跳过上游重复安装"/' "$installer"
-  if grep -qE '^[[:space:]]*install_linuxqq[[:space:]]*$' "$installer"; then
-    echo "修补 NapCat 上游 LinuxQQ 重复安装步骤失败"
-    return 1
-  fi
-}
-check_napcat_ready(){
-  local missing=0
-  command -v qq >/dev/null 2>&1 || { echo "[AstrBot Android] missing NapCat dependency: qq"; missing=1; }
-  command -v Xvfb >/dev/null 2>&1 || { echo "[AstrBot Android] missing NapCat dependency: Xvfb"; missing=1; }
-  dpkg-query -W -f='${Status}\n' linuxqq 2>/dev/null | grep -qx 'install ok installed' || { echo "[AstrBot Android] missing or broken NapCat dependency: linuxqq"; missing=1; }
-  dpkg-query -W -f='${Status}\n' libnss3 2>/dev/null | grep -qx 'install ok installed' || { echo "[AstrBot Android] missing or broken NapCat dependency: libnss3"; missing=1; }
-  dpkg-query -W -f='${Status}\n' libnspr4 2>/dev/null | grep -qx 'install ok installed' || { echo "[AstrBot Android] missing or broken NapCat dependency: libnspr4"; missing=1; }
-  { dpkg-query -W -f='${Status}\n' libasound2t64 2>/dev/null || dpkg-query -W -f='${Status}\n' libasound2 2>/dev/null; } | grep -qx 'install ok installed' || { echo "[AstrBot Android] missing or broken NapCat dependency: libasound2/libasound2t64"; missing=1; }
-  [ -f "$HOME/launcher.sh" ] || { echo "[AstrBot Android] missing NapCat launcher: $HOME/launcher.sh"; missing=1; }
-  [ -f "$HOME/libnapcat_launcher.so" ] || { echo "[AstrBot Android] missing NapCat launcher library: $HOME/libnapcat_launcher.so"; missing=1; }
-  [ -d "$HOME/napcat" ] || { echo "[AstrBot Android] missing NapCat directory: $HOME/napcat"; missing=1; }
-  [ "$missing" -eq 0 ]
-}
-install_napcat(){
-  if ! check_napcat_ready >/dev/null 2>&1; then
-    progress_echo "Napcat $L_NOT_INSTALLED，$L_INSTALLING..."
-    if ! prepare_apt_downloads; then echo "Ubuntu 软件源刷新失败，请检查上方 apt 输出"; exit 1; fi
-    if ! apt --fix-broken install -y; then echo "apt 修复依赖失败，继续安装并在结束时验收"; fi
-    if ! install_linuxqq; then echo "LinuxQQ 安装失败，NapCat 安装已中止"; exit 1; fi
-    if [ -d "$HOME/napcat/config" ]; then
-      echo "备份 NapCat 配置目录..."
-      cp -r "$HOME/napcat/config" "$HOME/napcat_config_backup"
-    fi
-    rm -rf "$HOME/napcat" "$HOME/napcat.sh" "$HOME/launcher.sh" "$HOME/launcher.cpp" "$HOME/libnapcat_launcher.so"
-    cd $HOME
-    if ! curl -fL -o napcat.sh https://raw.githubusercontent.com/NapNeko/napcat-linux-installer/refs/heads/main/install.sh; then
-      echo "下载 napcat.sh 失败"; exit 1
-    fi
-    if ! chmod +x napcat.sh; then echo "设置 napcat.sh 执行权限失败"; exit 1; fi
-    if ! patch_napcat_installer napcat.sh; then echo "修补 napcat.sh 失败"; exit 1; fi
-    if ! bash napcat.sh; then echo "NapCat 上游安装脚本执行失败"; exit 1; fi
-    pkill -f 'qq --no-sandbox' 2>/dev/null || true
-    pkill -f 'NapCat' 2>/dev/null || true
-    pkill -f 'napcat' 2>/dev/null || true
-    if [ -d "$HOME/napcat_config_backup" ]; then
-      echo "恢复 NapCat 配置目录..."
-      mkdir -p "$HOME/napcat/config"
-      cp -r "$HOME/napcat_config_backup"/* "$HOME/napcat/config/"
-      rm -rf "$HOME/napcat_config_backup"
-    fi
-  if [ ! -f "$HOME/napcat/config/onebot11.json" ]; then
-    echo "写入 onebot11.json 默认配置文件"
-    cat > "$HOME/napcat/config/onebot11.json" <<EOF
-{
-  "network": {
-    "httpServers": [],
-    "httpClients": [],
-    "websocketServers": [],
-    "websocketClients": [
-      {
-        "name": "WsClient",
-        "enable": true,
-        "url": "ws://localhost:${ASTRBOT_ONEBOT_WS_PORT:-6199}/ws",
-        "messagePostFormat": "array",
-        "reportSelfMessage": false,
-        "reconnectInterval": 5000,
-        "token": "kasdkfljsadhlskdjhasdlkfshdlafksjdhf",
-        "debug": false,
-        "heartInterval": 30000
-      }
-    ]
-  },
-  "musicSignUrl": "",
-  "enableLocalFile2Url": false,
-  "parseMultMsg": false
-}
-EOF
-  fi
-fi
-  configure_napcat_token_ttl
-  if ! check_napcat_ready; then
-    echo "NapCat 安装不完整，请查看上方 apt/dpkg/curl 错误后重试"
-    exit 1
-  fi
-  progress_echo "Napcat $L_INSTALLED"
-}
-]==]
-
-local SH_ASTRBOT = [==[
-install_astrbot(){
-  local INSTALL_DIR="$HOME/AstrBot"
-  local CLONE_TEMP_DIR="$HOME/AstrBot_tmp"
-  local BACKUP_DIR="/sdcard/Download/AstrBotBubble"
-  rm -rf "$CLONE_TEMP_DIR"
-  killall uv 2>/dev/null
-  if [ -d "$INSTALL_DIR" ] && { [ ! -f "$INSTALL_DIR/pyproject.toml" ] || [ ! -f "$INSTALL_DIR/main.py" ]; }; then
-    echo "AstrBot 安装目录不完整，准备重新安装..."
-    rm -rf "$HOME/AstrBot_data_reinstall_backup"
-    if [ -d "$INSTALL_DIR/data" ]; then cp -r "$INSTALL_DIR/data" "$HOME/AstrBot_data_reinstall_backup"; fi
-    rm -rf "$INSTALL_DIR"
-  fi
-  if [ ! -d "$INSTALL_DIR" ]; then
-    cd $HOME
-    progress_echo "AstrBot $L_NOT_INSTALLED，$L_INSTALLING..."
-    echo "正在获取 AstrBot 最新版本..."
-    if [ -n "$CUSTOM_GIT_CLONE" ]; then
-      echo "使用自定义 Git Clone 命令..."
-      if ! eval "$CUSTOM_GIT_CLONE"; then echo "自定义 Git Clone 命令执行失败"; exit 1; fi
-      if [ -d "AstrBot" ]; then mv "AstrBot" "$CLONE_TEMP_DIR"; else echo "错误: 未找到 AstrBot 目录"; exit 1; fi
-    else
-      network_test
-      LATEST_TAG=$(git ls-remote --tags --sort='-v:refname' ${target_proxy:+${target_proxy}/}https://github.com/AstrBotDevs/AstrBot.git | awk -F'/' '{print $3}' | sed 's/\^{}//g' | grep -E '^v?[0-9]+(\.[0-9]+){1,2}$' | head -n 1)
-      if [ -z "$LATEST_TAG" ]; then echo "警告: 无法获取最新 tag，使用 master 分支"; CLONE_BRANCH="master"; else echo "最新正式版: $LATEST_TAG"; CLONE_BRANCH="$LATEST_TAG"; fi
-      echo "正在克隆 AstrBot 仓库，分支/标签: $CLONE_BRANCH..."
-      if ! git clone --depth=1 --branch "$CLONE_BRANCH" ${target_proxy:+${target_proxy}/}https://github.com/AstrBotDevs/AstrBot.git "$CLONE_TEMP_DIR"; then
-        echo "克隆 AstrBot 仓库失败"; rm -rf "$CLONE_TEMP_DIR"; exit 1
-      fi
-    fi
-    mv "$CLONE_TEMP_DIR" "$INSTALL_DIR"
-  else
-    progress_echo "AstrBot $L_INSTALLED"
-  fi
-  progress_echo "AstrBot 初始化中"
-  cd "$INSTALL_DIR"
-  if [ ! -d "$INSTALL_DIR/data" ]; then
-    echo "检测到 data 目录不存在，初始化数据目录..."
-    mkdir "$INSTALL_DIR/data"
-    if [ -d "$HOME/AstrBot_data_reinstall_backup" ]; then
-      echo "恢复重装前 AstrBot 数据..."
-      rm -rf "$INSTALL_DIR/data"
-      mv "$HOME/AstrBot_data_reinstall_backup" "$INSTALL_DIR/data"
-      REINSTALL_PLUGINS_FLAG=1
-    else
-      LATEST_BACKUP=""
-      [ -d "$BACKUP_DIR" ] && LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/AstrBotBubble-backup-*.tar.gz 2>/dev/null | head -n 1)
-      if [ -n "$LATEST_BACKUP" ]; then
-        echo "找到备份文件: $LATEST_BACKUP"
-        if tar -xzf "$LATEST_BACKUP" -C "$INSTALL_DIR"; then
-          echo "备份恢复成功"; REINSTALL_PLUGINS_FLAG=1
-        else
-          echo "备份恢复失败，将使用 AstrBot 默认配置 (首次启动自动生成)"
-        fi
-      else
-        # 不再替换预置 cmd_config.json: AstrBot 首次启动会生成默认配置,
-        # NapCat 的 aiocqhttp 适配器改由「创建 NapCat 账号」时自动写入 (见 NC.sync_adapter)。
-        echo "无备份，使用 AstrBot 默认配置 (NapCat 适配器在创建账号时自动绑定)"
-      fi
-    fi
-    rm -rf "$INSTALL_DIR/.venv"
-  fi
-  if [ ! -d "$INSTALL_DIR/.venv" ] || ! $HOME/.local/bin/uv run --no-sync python -c "import aiohttp" >/dev/null 2>&1; then
-    echo "同步 AstrBot 依赖..."
-    if ! $HOME/.local/bin/uv sync; then echo "依赖同步失败"; exit 1; fi
-    REINSTALL_PLUGINS_FLAG=1
-  fi
-  if [ "$REINSTALL_PLUGINS_FLAG" -eq 1 ]; then
-    echo "检测到重装插件依赖标记，开始重装..."
-    if [ -d "$INSTALL_DIR/data/plugins" ]; then
-      for plugin_dir in "$INSTALL_DIR/data/plugins"/*; do
-        if [ -d "$plugin_dir" ] && [ -f "$plugin_dir/requirements.txt" ]; then
-          echo "安装插件依赖: $(basename "$plugin_dir")..."
-          cd "$INSTALL_DIR"
-          $HOME/.local/bin/uv pip install -r "$plugin_dir/requirements.txt" 2>/dev/null || echo "警告: 插件依赖安装失败，将在启动时重试"
-        fi
-      done
-    fi
-  fi
-  progress_echo "AstrBot 安装完成"
-}
-]==]
-
--- 每个按钮下面就是它自己那一步的命令序列:
 local function step_base(reinstall)
-  host.spawn(env_pre(reinstall and "base" or "") .. "\n" .. SH_HELPERS .. SH_BASE .. [==[
-maybe_prepare_reinstall base
-install_sudo_curl_git
-]==], "基础命令")
-  host.nav.go(2)
+  run_installer_step("base", reinstall)
 end
 
 local function step_uv(reinstall)
-  host.spawn(env_pre(reinstall and "uv" or "") .. "\n" .. SH_HELPERS .. SH_NET .. SH_BASE .. SH_UV .. [==[
-maybe_prepare_reinstall uv
-install_sudo_curl_git
-install_uv
-]==], "uv")
-  host.nav.go(2)
+  run_installer_step("uv", reinstall)
 end
 
 local function step_napcat(reinstall)
-  host.spawn(env_pre(reinstall and "napcat" or "") .. "\n" .. SH_HELPERS .. SH_BASE .. SH_NAPCAT .. [==[
-maybe_prepare_reinstall napcat
-install_sudo_curl_git
-install_napcat
-]==], "NapCat")
-  host.nav.go(2)
+  run_installer_step("napcat", reinstall)
 end
 
 local function step_astrbot(reinstall, force_plugins)
-  local pre = env_pre(reinstall and "astrbot" or "")
-  local flag = force_plugins and "1" or "0"
-  host.spawn(pre .. "\nexport REINSTALL_PLUGINS_FLAG=" .. flag .. "\nCUSTOM_GIT_CLONE=\"\"\n"
-    .. SH_HELPERS .. SH_NET .. SH_BASE .. SH_UV .. SH_ASTRBOT .. [==[
-maybe_prepare_reinstall astrbot
-install_sudo_curl_git
-install_uv
-install_astrbot
-]==], "AstrBot")
-  host.nav.go(2)
+  run_installer_step("astrbot", reinstall, force_plugins)
 end
 
 local STEP_RUN = {
@@ -679,8 +266,161 @@ local STEP_RUN = {
   uv = step_uv,
   napcat = step_napcat,
   astrbot = step_astrbot,
-  opencode = function(reinstall) agent.install(reinstall) end,
+  opencode = function(reinstall) run_installer_step("opencode", reinstall) end,
 }
+
+local function update_installer(on_exit)
+  installer.update({
+    title = "更新安装脚本",
+    key = "installer-update",
+    on_exit = on_exit,
+  })
+  host.nav.go(2)
+end
+
+local function compare_versions(left, right)
+  local function parts(value)
+    local a, b, c = tostring(value or ""):match("^(%d+)%.(%d+)%.(%d+)$")
+    if not a then return nil end
+    return { tonumber(a), tonumber(b), tonumber(c) }
+  end
+  local l, r = parts(left), parts(right)
+  if not l or not r then return nil end
+  for i = 1, 3 do
+    if l[i] ~= r[i] then return l[i] < r[i] and -1 or 1 end
+  end
+  return 0
+end
+
+local installer_check_generation = 0
+local check_then_offer_installer_update
+local INSTALLER_REPOSITORY_URL = "https://github.com/MuFengDR/AstrBot-Android-Scripts/releases/latest"
+
+local function show_installer_check_failure(timed_out, on_updated)
+  host.dialog({
+    title = "安装脚本更新",
+    build = function()
+      return row({
+        icon(timed_out and "timer_off_outlined" or "error_outline"),
+        expanded(text(timed_out and
+          "检查超过 60 秒，已停止。可前往脚本仓库下载离线包，然后使用“导入脚本”手动导入。" or
+          "检查失败。可前往脚本仓库下载离线包，然后使用“导入脚本”手动导入。")),
+      }, { gap = 16, cross = "center" })
+    end,
+    actions = {
+      { label = "关闭", variant = "text" },
+      { label = "打开脚本仓库", variant = "text", onTap = function()
+        host.open_url(INSTALLER_REPOSITORY_URL)
+      end },
+      { label = "重试", variant = "tonal", onTap = function()
+        host.close_dialog()
+        host.delay(50, function() check_then_offer_installer_update(on_updated) end)
+      end },
+    },
+  })
+end
+
+local function show_installer_check_result(script, on_updated)
+  local checked = installer.read_check_result()
+  local output = checked.output or ""
+  local current = output:match("Current version:%s*([^%s]+)")
+  local remote = output:match("Verified remote version:%s*([^%s]+)")
+
+  if checked.code ~= 0 or not remote then
+    show_installer_check_failure(false, on_updated)
+    return
+  end
+
+  local update_available = current == "not-installed" or
+    compare_versions(current, remote) == -1
+  if not update_available then
+    host.dialog({
+      title = "安装脚本更新",
+      build = function()
+        return row({
+          icon("check_circle_outline", { color = "green" }),
+          expanded(text("当前已是最新安装脚本。")),
+        }, { gap = 16, cross = "center" })
+      end,
+      actions = { { label = "关闭", variant = "text" } },
+    })
+    return
+  end
+
+  local first_download = script.state == "missing"
+  host.dialog({
+    title = "安装脚本更新",
+    build = function()
+      return row({
+        icon("system_update_alt"),
+        expanded(text(first_download and "已找到可用安装脚本，是否立即下载？" or
+          "发现新版安装脚本，是否立即更新？")),
+      }, { gap = 16, cross = "center" })
+    end,
+    actions = {
+      { label = "关闭", variant = "text" },
+      { label = first_download and "立即下载" or "立即更新", variant = "filled", onTap = function()
+        host.close_dialog()
+        update_installer(on_updated)
+      end },
+    },
+  })
+end
+
+check_then_offer_installer_update = function(on_updated)
+  local script = installer_script_info()
+  installer_check_generation = installer_check_generation + 1
+  local generation = installer_check_generation
+  host.dialog({
+    title = "安装脚本更新",
+    build = function()
+      return row({
+        spinner({ size = 24 }),
+        expanded(text("正在检查安装脚本更新，请稍候…")),
+      }, { gap = 16, cross = "center" })
+    end,
+    actions = {
+      { label = "取消", variant = "text", onTap = function()
+        installer_check_generation = installer_check_generation + 1
+        host.stop("installer-check")
+        host.close_dialog()
+      end },
+    },
+  })
+  installer.check({
+    title = "检查安装脚本更新",
+    key = "installer-check",
+    on_exit = function()
+      if generation ~= installer_check_generation then return end
+      installer_check_generation = installer_check_generation + 1
+      host.close_dialog()
+      show_installer_check_result(script, on_updated)
+    end,
+  })
+  host.delay(60000, function()
+    if generation ~= installer_check_generation then return end
+    installer_check_generation = installer_check_generation + 1
+    host.stop("installer-check")
+    host.close_dialog()
+    show_installer_check_failure(true, on_updated)
+  end)
+end
+
+local function import_installer_package(on_exit)
+  host.input({
+    title = "导入离线安装脚本包",
+    hint = "/sdcard/Download/astrbot-installer-offline.tar.gz",
+  }, function(path)
+    if not path or path == "" then return end
+    if installer.import(path, {
+      title = "导入安装脚本包",
+      key = "installer-import",
+      on_exit = on_exit,
+    }) then
+      host.nav.go(2)
+    end
+  end)
+end
 
 -- ============================================================
 -- AstrBot 启停: 纯 Lua, 通过通用原语 host.spawn/host.stop, 运行态读 ctx.running
@@ -1330,6 +1070,17 @@ local function quick_start_card(ctx)
 end
 
 local function env_card()
+  local revision = state("environment.rev", 0)
+  revision.get()
+  local script = installer_script_info()
+  local script_ready = script.state == "valid"
+  local script_label = script_ready and ("v" .. script.version) or
+    (script.state == "unknown" and "未知版本" or "脚本未下载")
+  local installed = {}
+  for _, step in ipairs(ENV_STEPS) do installed[step.id] = env_installed(step.id) end
+  local function refresh_after_exit()
+    revision.set(revision.get() + 1)
+  end
   local children = {
     tile("GitHub 代理", {
       icon = "cloud_sync_outlined",
@@ -1337,19 +1088,29 @@ local function env_card()
       trailing = icon("chevron_right"),
       onTap = open_gh_dialog,
     }),
+    row({
+      expanded(button(script.state == "missing" and "下载脚本" or "更新脚本", function()
+        check_then_offer_installer_update(refresh_after_exit)
+      end, { variant = "filled", icon = "system_update_alt" })),
+      expanded(button("导入脚本", function()
+        import_installer_package(refresh_after_exit)
+      end, { variant = "outlined", icon = "upload_file" })),
+    }, { gap = 12 }),
   }
   for _, s in ipairs(ENV_STEPS) do
-    local done = env_installed(s.id)
+    local done = installed[s.id]
+    local enabled = env_step_enabled(s.id, installed, script_ready)
     children[#children + 1] = tile(s.title, {
-      icon = done and "check_circle" or "error_outline",
-      iconColor = done and "green" or "orange",
-      subtitle = s.sub,
-      trailing = button(done and "重装" or "安装", function()
+      icon = not enabled and "lock_outline" or (done and "check_circle" or "error_outline"),
+      iconColor = not enabled and "grey" or (done and "green" or "orange"),
+      subtitle = enabled and s.sub or
+        (script_ready and "请先安装上方依赖项" or "请先下载或更新脚本"),
+      trailing = button(done and "重装" or "安装", enabled and function()
         STEP_RUN[s.id](done)
-      end, { variant = "tonal" }),
+      end or nil, { variant = "tonal" }),
     })
   end
-  return expansion("环境管理", children, { icon = "build_outlined" })
+  return expansion("环境管理 · " .. script_label, children, { icon = "build_outlined" })
 end
 
 local function add_napcat()
@@ -2061,6 +1822,13 @@ end
 
 local function manage_section(ctx)
   return expansion("AstrBot 管理", {
+    tile("Lua 皮肤更新", {
+      icon = "system_update_alt",
+      subtitle = "当前版本 v" .. LUA_SCRIPT_VERSION,
+      trailing = button("检查", function()
+        skin_updater.check(LUA_SCRIPT_VERSION, gh_proxy())
+      end, { variant = "tonal" }),
+    }),
     tile("自诊断", {
       icon = "health_and_safety_outlined",
       subtitle = "检查环境、进程、连接和各 AstrBot 配置",
@@ -2103,7 +1871,7 @@ app.page("home", function(ctx)
     napcat_card(ctx),
     env_card(),
     manage_section(ctx),
-    padding(text("泡泡 Lua v" .. LUA_SCRIPT_VERSION, {
+    padding(text("Lua 皮肤 v" .. LUA_SCRIPT_VERSION, {
       size = 11, color = "grey", align = "center",
     }), { v = 8 }),
   }
