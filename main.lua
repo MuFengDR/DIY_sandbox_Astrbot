@@ -228,7 +228,7 @@ local STEP_TITLES = {
   opencode = "OpenCode",
 }
 
-local function run_installer_step(step, reinstall, reinstall_plugins)
+local function run_installer_step(step, reinstall, reinstall_plugins, reinstall_linuxqq)
   if installer_script_info().state ~= "valid" then
     host.toast("请先下载或更新脚本")
     return false
@@ -236,6 +236,7 @@ local function run_installer_step(step, reinstall, reinstall_plugins)
   installer.run(step, {
     reinstall = reinstall == true,
     reinstall_plugins = reinstall_plugins == true,
+    reinstall_linuxqq = reinstall_linuxqq == true,
     dashboard_port = ports.get("dashboard"),
     onebot_ws_port = ports.get("onebot"),
     title = STEP_TITLES[step] or "安装脚本",
@@ -253,8 +254,33 @@ local function step_uv(reinstall)
   run_installer_step("uv", reinstall)
 end
 
-local function step_napcat(reinstall)
-  run_installer_step("napcat", reinstall)
+local function step_napcat(reinstall, reinstall_linuxqq)
+  run_installer_step("napcat", reinstall, false, reinstall_linuxqq)
+end
+
+local function confirm_napcat_reinstall()
+  local reinstall_linuxqq = false
+  host.dialog({
+    title = "重装 NapCat",
+    build = function()
+      return column({
+        text("将清理 NapCat 安装文件并重新安装，尽量保留配置目录。"),
+        checkbox({
+          title = "同时重装 QQ",
+          value = reinstall_linuxqq,
+          onChanged = function(value) reinstall_linuxqq = value == true end,
+        }),
+        text("未安装 QQ 时，即使不勾选也会自动安装。", { size = 12, color = "grey" }),
+      }, { gap = 8 })
+    end,
+    actions = {
+      { label = "取消", variant = "text" },
+      { label = "确认重装", variant = "filled", onTap = function()
+        local force_linuxqq = reinstall_linuxqq
+        host.delay(100, function() step_napcat(true, force_linuxqq) end)
+      end },
+    },
+  })
 end
 
 local function step_astrbot(reinstall, force_plugins)
@@ -1106,7 +1132,11 @@ local function env_card()
       subtitle = enabled and s.sub or
         (script_ready and "请先安装上方依赖项" or "请先下载或更新脚本"),
       trailing = button(done and "重装" or "安装", enabled and function()
-        STEP_RUN[s.id](done)
+        if s.id == "napcat" and done then
+          confirm_napcat_reinstall()
+        else
+          STEP_RUN[s.id](done)
+        end
       end or nil, { variant = "tonal" }),
     })
   end

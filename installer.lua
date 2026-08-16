@@ -54,6 +54,7 @@ local function command_prefix(options)
     "export ASTRBOT_ONEBOT_WS_PORT=" .. shell_quote(options.onebot_ws_port or 6199),
     "export ASTRBOT_GITHUB_PROXY=" .. shell_quote(github_proxy()),
     "export ASTRBOT_FORCE_REINSTALL_STEP=" .. shell_quote(options.reinstall and options.step or ""),
+    "export ASTRBOT_LINUXQQ_FORCE_INSTALL=" .. shell_quote(options.reinstall_linuxqq and 1 or 0),
     "export L_NOT_INSTALLED=" .. shell_quote("未安装"),
     "export L_INSTALLING=" .. shell_quote("安装中"),
     "export L_INSTALLED=" .. shell_quote("已安装"),
