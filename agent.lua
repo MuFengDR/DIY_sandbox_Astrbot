@@ -139,4 +139,12 @@ function M.stop()
   S.running = false
 end
 
+function M.open(target_dir, tab_name)
+  if S.running and S.port then
+    open_webui(target_dir, tab_name)
+  else
+    M.launch(target_dir, tab_name)
+  end
+end
+
 return M

@@ -1,7 +1,7 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0-beta5.5"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.5.1"
 
 -- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
@@ -1252,6 +1252,31 @@ local function napcat_card(ctx)
   return card(nil, children)
 end
 
+local function opencode_card()
+  if not agent.installed() then return nil end
+  local revision = state("opencode.rev", 0)
+  revision.get()
+  local running = agent.running()
+  return card(nil, {
+    row({
+      icon("smart_toy_outlined"),
+      spacer(8),
+      expanded(text("OpenCode", { weight = "bold", size = 16 })),
+    }, { cross = "center" }),
+    spacer(12),
+    row({
+      expanded(button(running and "停止" or "启动", function()
+        if running then agent.stop() else agent.launch() end
+        revision.set(revision.get() + 1)
+      end, { icon = running and "stop" or "play_arrow" })),
+      expanded(button("打开 WebUI", function()
+        agent.open()
+        revision.set(revision.get() + 1)
+      end, { variant = "tonal", icon = "language" })),
+    }, { gap = 12 }),
+  })
+end
+
 local function do_backup(cb)
   local ub = host.ubuntu_path()
   if not host.exists(ub .. "/root/AstrBot/data") then
@@ -1896,16 +1921,20 @@ local function manage_section(ctx)
 end
 
 app.page("home", function(ctx)
-  return {
+  local children = {
     quick_start_card(ctx),
     napcat_card(ctx),
-    env_card(),
-    manage_section(ctx),
+  }
+  local opencode = opencode_card()
+  if opencode then children[#children + 1] = opencode end
+  children[#children + 1] = env_card()
+  children[#children + 1] = manage_section(ctx)
+  children[#children + 1] =
     padding(text("Lua 皮肤 v" .. LUA_SCRIPT_VERSION, {
       size = 11, color = "grey", align = "center",
-    }), { v = 8 }),
-  }
+    }), { v = 8 })
+  return children
 end)
 
--- 主页顶栏的两个 Agent 入口按钮已移至受保护的 agent/main.lua,
+-- 主页顶栏的 Agent 入口按钮已移至受保护的 agent/main.lua,
 -- 与本文件解耦: 即使这里被改坏, agent 启动入口依然稳定存在。
