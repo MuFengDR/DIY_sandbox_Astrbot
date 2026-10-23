@@ -4,7 +4,11 @@
 
 ## 更新
 
-皮肤通常由应用内的“Lua 皮肤更新”功能检查并更新。更新器读取仓库最新 Release 的 tag，并通过 HTTPS 下载对应提交中的皮肤文件。更新内容包括界面、交互和环境管理逻辑。
+皮肤通常由应用内的“Lua 皮肤更新”功能检查并更新。更新器读取仓库最新 Release 的 tag，先从该 tag 获取 `skin-update-manifest.json`，验证清单格式、版本号和相对路径，再按目标版本清单下载所有皮肤文件，包括新增模块和资源。下载全部成功后才开始写入并重载；清单获取或验证失败时停止更新，不回退到本地旧清单。
+
+每次发布前运行 `local-package/build-local-skin.bat`，它会按 `main.lua` 的 `LUA_SCRIPT_VERSION` 生成根目录的清单，并按同一份清单打包。将生成的 `skin-update-manifest.json` 和对应运行文件一并提交到发布 tag，Release 版本号去掉前缀 `v` 后须与皮肤版本一致。也可只运行 `scripts/generate-update-manifest.ps1` 生成清单。清单自动收集根目录 Lua 模块、README 和运行资源子目录，排除隐藏文件、`AGENTS.md`、`scripts/`、`local-package/`、`keys/`；新增运行文件无需再修改更新器。
+
+已删除的资源不再下载，手机中历史文件暂不自动清理。旧版仍使用本地固定清单，无法自行切换到目标清单机制，需手动导入一次新版完整 ZIP。若要让旧版通过在线更新过渡，过渡 Release 必须保留旧清单要求的全部文件（包括旧版请求的 `assets/linuxqq.png`）。
 
 如果应用内更新无法完成，可以从本仓库的 [Releases](https://github.com/MuFengDR/DIY_sandbox_Astrbot/releases) 下载源码 ZIP，再通过沙盒本体的皮肤导入功能安装。
 
@@ -28,8 +32,10 @@ bootstrap 工具安装被强制终止后，下一次离线安装会先修复 dpk
 
 ## 本地打包与同步
 
-运行 `local-package/build-local-skin.bat`，或 PowerShell 执行 `local-package/build-local-skin.ps1`，生成可直接导入的 `local-package/astrbot-lua-skin-local.zip`。ZIP 必须包含 `offline_packages.lua` 和整个 `assets/`，不要只拷贝 main.lua。皮肤在线更新清单已包含这些资源。
+运行 `local-package/build-local-skin.bat`，或 PowerShell 执行 `local-package/build-local-skin.ps1`，自动生成目标更新清单及可直接导入的 `local-package/astrbot-lua-skin-local.zip`。ZIP 包含清单中的全部运行文件，不要只拷贝 main.lua。
 
 本地打包脚本使用 `/` 作为 ZIP 内部路径分隔符，兼容 Android。不要改用 Windows PowerShell 的 `Compress-Archive`，其生成的反斜杠路径可能导致导入后提示资源缺失。遇到此前版本的该问题，重新导入修正版完整 ZIP 即可。
 
-与泡泡版放在当前工作区布局下时，运行 `scripts/sync-bubble-offline.ps1` 可同步离线安装引擎、在线 LinuxQQ 安装分支、bootstrap 和企鹅图标；其他位置可传入 `-BubbleRoot` 指定泡泡版源码根目录。五个大组件包由用户另行下载，均不打入皮肤 ZIP。
+与泡泡版放在当前工作区布局下时，运行 `scripts/sync-bubble-offline.ps1` 可同步离线安装引擎、在线 LinuxQQ 安装分支和 bootstrap；其他位置可传入 `-BubbleRoot` 指定泡泡版源码根目录。五个大组件包由用户另行下载，均不打入皮肤 ZIP。
+
+LinuxQQ 使用与其他组件一致的状态图标，不再需要 `assets/linuxqq.png`。旧版更新器仍会请求该文件，需手动导入一次新版完整皮肤 ZIP，之后在线更新不再下载该图标。

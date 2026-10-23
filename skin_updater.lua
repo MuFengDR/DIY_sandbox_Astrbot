@@ -1,6 +1,6 @@
 -- Lua skin updater.
--- It follows the latest GitHub Release tag and downloads only the allow-listed
--- skin files over HTTPS. The Linux installer keeps its separate signature flow.
+-- Read the target Release's manifest before downloading its skin files.
+-- The Linux installer keeps its separate signature flow.
 
 local M = {}
 
@@ -10,20 +10,7 @@ local RELEASE_API = "https://api.github.com/repos/" .. OWNER .. "/" .. REPOSITOR
 -- The sandbox runtime exposes the active skin directory as the global SCRIPTS.
 local SCRIPTS = SCRIPTS
 
-local UPDATE_FILES = {
-  "main.lua",
-  "agent.lua",
-  "installer.lua",
-  "installer_bootstrap.lua",
-  "offline_packages.lua",
-  "skin_updater.lua",
-  "assets/offline-installer.py",
-  "assets/bundled-component-installer.sh",
-  "assets/bootstrap-offline.tar.gz",
-  "assets/linuxqq.png",
-  "agent/main.lua",
-  "agent/sandbox",
-}
+local MANIFEST_PATH = "skin-update-manifest.json"
 
 local operation_state = { checking = false, updating = false }
 local current_http_id = nil
@@ -88,9 +75,9 @@ end
 
 local function show_update_dialog()
   local progress = {
-    phase = "正在准备更新",
+    phase = "正在获取目标版本的更新清单",
     current = 0,
-    total = #UPDATE_FILES,
+    total = 0,
     rev = state("lua.skin.update.rev", 0),
   }
   update_dialog_state = progress
@@ -121,6 +108,54 @@ local function response_bytes(value)
   end
   -- Text responses may be returned directly by some host/proxy combinations.
   return value, host.base64_encode(value)
+end
+
+local function manifest_files(encoded, version)
+  local body = host.base64_decode(encoded)
+  if type(body) ~= "string" then return nil, "更新清单无法解码" end
+  local ok, manifest = pcall(json.decode, body)
+  if not ok or type(manifest) ~= "table" or manifest.format ~= "astrbot-skin-update-v1" then
+    return nil, "更新清单格式无效"
+  end
+  if manifest.version ~= version then return nil, "更新清单版本与目标 Release 不一致" end
+  if type(manifest.files) ~= "table" or #manifest.files == 0 or #manifest.files > 512 then
+    return nil, "更新清单文件列表无效"
+  end
+  local files, seen = {}, {}
+  for _, path in ipairs(manifest.files) do
+    if type(path) ~= "string" or #path > 240 or
+        not path:match("^[%w_%-][%w%._%-%/]*$") or path:sub(-1) == "/" or
+        path:find("//", 1, true) or path == MANIFEST_PATH or seen[path] then
+      return nil, "更新清单包含无效或重复路径"
+    end
+    for segment in path:gmatch("[^/]+") do
+      if segment:sub(1, 1) == "." then return nil, "更新清单包含不安全路径" end
+    end
+    local root = path:match("^([^/]+)/")
+    if root == "scripts" or root == "local-package" or root == "keys" then
+      return nil, "更新清单包含开发目录"
+    end
+    seen[path] = true
+    files[#files + 1] = path
+  end
+  local count = 0
+  for key in pairs(manifest.files) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #files then
+      return nil, "更新清单文件列表必须为数组"
+    end
+    count = count + 1
+  end
+  if count ~= #files or not seen["main.lua"] or not seen["skin_updater.lua"] then
+    return nil, "更新清单缺少皮肤入口或更新器"
+  end
+  for _, path in ipairs(files) do
+    local parent = path:match("^(.*)/[^/]+$")
+    while parent do
+      if seen[parent] then return nil, "更新清单的文件与目录路径冲突" end
+      parent = parent:match("^(.*)/[^/]+$")
+    end
+  end
+  return files
 end
 
 local function parse_version(value)
@@ -184,8 +219,15 @@ end
 
 local function update_files(release, proxy)
   local payloads = {}
+  local files = {}
   local index = 1
   local generation = update_generation
+
+  local function fail(message)
+    operation_state.updating = false
+    close_update_dialog()
+    host.toast(message)
+  end
 
   local function fetch_file(path, callback)
     local function request(url, allow_direct_retry)
@@ -212,11 +254,15 @@ local function update_files(release, proxy)
 
   local function finish()
     if generation ~= update_generation then return end
-    for _, path in ipairs(UPDATE_FILES) do
-      local directory = path:match("^(.*)/[^/]+$")
-      if directory then host.mkdirs(SCRIPTS .. "/" .. directory) end
-      host.write_bytes(SCRIPTS .. "/" .. path, payloads[path])
-    end
+    local ok, error_message = pcall(function()
+      for _, path in ipairs(files) do
+        local directory = path:match("^(.*)/[^/]+$")
+        if directory then host.mkdirs(SCRIPTS .. "/" .. directory) end
+        assert(host.write_bytes(SCRIPTS .. "/" .. path, payloads[path]), "无法写入 " .. path)
+      end
+      assert(host.write_bytes(SCRIPTS .. "/" .. MANIFEST_PATH, payloads[MANIFEST_PATH]), "无法写入更新清单")
+    end)
+    if not ok then fail("应用皮肤更新失败: " .. tostring(error_message)); return end
     operation_state.updating = false
     if update_dialog_state then
       update_dialog_state.phase = "更新完成，正在重载"
@@ -231,13 +277,11 @@ local function update_files(release, proxy)
   end
 
   local function next_file()
-    local path = UPDATE_FILES[index]
+    local path = files[index]
     if not path then finish(); return end
     fetch_file(path, function(content_b64, error_message)
       if not content_b64 then
-        operation_state.updating = false
-        close_update_dialog()
-        host.toast("下载 " .. path .. " 失败: " .. tostring(error_message))
+        fail("下载 " .. path .. " 失败: " .. tostring(error_message))
         return
       end
       payloads[path] = content_b64
@@ -251,7 +295,22 @@ local function update_files(release, proxy)
     end)
   end
 
-  next_file()
+  fetch_file(MANIFEST_PATH, function(encoded, error_message)
+    if not encoded then
+      fail("获取目标版本更新清单失败，请确认发布时包含 " .. MANIFEST_PATH .. ": " .. tostring(error_message))
+      return
+    end
+    local target_files, manifest_error = manifest_files(encoded, release.version)
+    if not target_files then fail("目标版本更新清单无效: " .. tostring(manifest_error)); return end
+    files = target_files
+    payloads[MANIFEST_PATH] = encoded
+    if update_dialog_state then
+      update_dialog_state.phase = "已获取目标版本更新清单，正在下载"
+      update_dialog_state.total = #files
+      bump_update_dialog()
+    end
+    next_file()
+  end)
 end
 
 function M.check(current_version, proxy)
