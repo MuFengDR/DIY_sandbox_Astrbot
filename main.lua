@@ -1,11 +1,12 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0-beta5.5.1"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.1"
 
 -- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
 local installer = require("installer")
+local offline_packages = require("offline_packages")
 local skin_updater = require("skin_updater")
 local ffi_ok, ffi = pcall(require, "ffi")
 if ffi_ok then pcall(ffi.cdef, "int access(const char *pathname, int mode);") end
@@ -160,7 +161,10 @@ local function env_installed(step)
   if step == "base" then
     return host.exists(ub .. "/usr/bin/git") and host.exists(ub .. "/usr/bin/curl") and host.exists(ub .. "/usr/bin/sudo")
   elseif step == "uv" then
-    return host.exists(ub .. "/root/.local/bin/uv")
+    return host.exists(ub .. "/root/.local/bin/uv") and host.exists(ub .. "/root/.local/bin/uvx")
+  elseif step == "linuxqq" then
+    return (host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq")) and
+      dpkg_marker(ub, "linuxqq")
   elseif step == "napcat" then
     local qq = host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq") or
       host.exists(ub .. "/opt/QQ/qq")
@@ -199,51 +203,55 @@ local function installer_script_info()
 end
 
 local function env_step_enabled(step, installed, script_ready)
-  if not script_ready then return false end
+  if not script_ready and not installer.offline_supported(step) then return false end
   if step == "base" then return true end
-  if step == "uv" or step == "napcat" or step == "opencode" then
+  if step == "uv" or step == "linuxqq" or step == "opencode" then
     return installed.base == true
   end
-  if step == "astrbot" then return installed.uv == true end
+  if step == "napcat" then return installed.base == true and installed.linuxqq == true end
+  if step == "astrbot" then return installed.base == true and installed.uv == true end
   return false
 end
 
 local ENV_STEPS = {
   { id = "base",    title = "基础命令", sub = "sudo / git / curl" },
   { id = "uv",      title = "uv",       sub = "Python 依赖管理工具" },
-  { id = "astrbot", title = "AstrBot",  sub = "克隆 AstrBot 并同步依赖" },
+  { id = "linuxqq", title = "LinuxQQ",  sub = "NapCat 所需的 ARM64 QQ 客户端" },
   { id = "napcat",  title = "NapCat",   sub = "安装或修复 NapCatQQ" },
+  { id = "astrbot", title = "AstrBot",  sub = "安装 AstrBot 及 Python 依赖" },
   { id = "opencode", title = "OpenCode", sub = "DIY AI coding agent" },
 }
 
 -- ============================================================
--- 所有 Linux 安装步骤均通过同一份已签名的远端安装器运行。
--- 此处只保留 UI 需要的参数与终端入口，安装实现不再复制到皮肤内。
+-- 在线安装继续使用签名远端安装器；离线安装使用与泡泡版相同的内置引擎。
 -- ============================================================
 local STEP_TITLES = {
   base = "基础命令",
   uv = "uv",
+  linuxqq = "LinuxQQ",
   napcat = "NapCat",
   astrbot = "AstrBot",
   opencode = "OpenCode",
 }
 
-local function run_installer_step(step, reinstall, reinstall_plugins, reinstall_linuxqq)
-  if installer_script_info().state ~= "valid" then
-    host.toast("请先下载或更新脚本")
+local function run_installer_step(step, reinstall, reinstall_plugins, reinstall_linuxqq, offline_package)
+  if not offline_package and installer_script_info().state ~= "valid" then
+    host.toast("在线安装请先下载或更新脚本，也可以选择离线安装")
     return false
   end
-  installer.run(step, {
+  local started = installer.run(step, {
     reinstall = reinstall == true,
     reinstall_plugins = reinstall_plugins == true,
     reinstall_linuxqq = reinstall_linuxqq == true,
+    offline = offline_package ~= nil,
+    package_path = offline_package,
     dashboard_port = ports.get("dashboard"),
     onebot_ws_port = ports.get("onebot"),
     title = STEP_TITLES[step] or "安装脚本",
     key = "installer-" .. step,
   })
-  host.nav.go(2)
-  return true
+  if started then host.nav.go(2) end
+  return started
 end
 
 local function step_base(reinstall)
@@ -290,6 +298,7 @@ end
 local STEP_RUN = {
   base = step_base,
   uv = step_uv,
+  linuxqq = function(reinstall) run_installer_step("linuxqq", reinstall) end,
   napcat = step_napcat,
   astrbot = step_astrbot,
   opencode = function(reinstall) run_installer_step("opencode", reinstall) end,
@@ -1095,7 +1104,7 @@ local function quick_start_card(ctx)
   })
 end
 
-local function env_card()
+local function env_card(ctx)
   local revision = state("environment.rev", 0)
   revision.get()
   local script = installer_script_info()
@@ -1126,19 +1135,35 @@ local function env_card()
   for _, s in ipairs(ENV_STEPS) do
     local done = installed[s.id]
     local enabled = env_step_enabled(s.id, installed, script_ready)
-    children[#children + 1] = tile(s.title, {
-      icon = not enabled and "lock_outline" or (done and "check_circle" or "error_outline"),
+    local function install_action()
+      for key, running in pairs(ctx.running or {}) do
+        if running and (key == "astrbot" or key:match("^napcat:") or key:match("^installer%-")) then
+          host.toast("请先停止 AstrBot、NapCat 账号和其他安装任务")
+          return
+        end
+      end
+      local function online()
+        if s.id == "napcat" and done then confirm_napcat_reinstall()
+        else STEP_RUN[s.id](done) end
+      end
+      if installer.offline_supported(s.id) then
+        offline_packages.choose(s.id, {
+          title = s.title, reinstall = done,
+          on_online = online,
+          on_offline = function(path) run_installer_step(s.id, done, false, false, path) end,
+        })
+      else online() end
+    end
+    local status_icon = not enabled and "lock_outline" or (done and "check_circle" or "error_outline")
+    local options = {
+      icon = status_icon,
       iconColor = not enabled and "grey" or (done and "green" or "orange"),
       subtitle = enabled and s.sub or
-        (script_ready and "请先安装上方依赖项" or "请先下载或更新脚本"),
-      trailing = button(done and "重装" or "安装", enabled and function()
-        if s.id == "napcat" and done then
-          confirm_napcat_reinstall()
-        else
-          STEP_RUN[s.id](done)
-        end
-      end or nil, { variant = "tonal" }),
-    })
+        (s.id == "napcat" and "请先安装基础环境和 LinuxQQ" or
+          (installer.offline_supported(s.id) and "请先安装上方依赖项" or "请先下载或更新脚本")),
+      trailing = button(done and "重装" or "安装", enabled and install_action or nil, { variant = "tonal" }),
+    }
+    children[#children + 1] = tile(s.title, options)
   end
   return expansion("环境管理 · " .. script_label, children, { icon = "build_outlined" })
 end
@@ -1875,8 +1900,33 @@ local function open_diagnostic_dialog(ctx)
   })
 end
 
+local cache_cleanup_running = false
+local function clear_offline_cache(ctx)
+  if cache_cleanup_running then return end
+  for key, active in pairs(ctx.running or {}) do
+    if active and key:match("^installer%-") then
+      host.toast("安装任务正在进行，请结束后再清理缓存")
+      return
+    end
+  end
+  host.confirm("将删除全部组件离线包缓存，释放存储空间。已安装组件、账号和 AstrBot 数据会保留。\n\n以后离线重装需要重新选择安装包。", function(confirmed)
+    if not confirmed then return end
+    cache_cleanup_running = true
+    local started = installer.clear_cache(function(bytes, err)
+      cache_cleanup_running = false
+      if not bytes then host.toast("清理失败：" .. tostring(err)); return end
+      local size = bytes >= 1024 * 1024 * 1024 and string.format("%.2f GB", bytes / (1024 * 1024 * 1024)) or
+        string.format("%.2f MB", bytes / (1024 * 1024))
+      host.toast(bytes == 0 and "没有可清理的离线包缓存" or ("离线包缓存已删除，释放 " .. size))
+      local revision = state("environment.rev", 0)
+      revision.set(revision.get() + 1)
+    end)
+    if not started then cache_cleanup_running = false end
+  end, { title = "删除所有离线包缓存？", ok_text = "删除缓存", cancel_text = "取消" })
+end
+
 local function manage_section(ctx)
-  return expansion("AstrBot 管理", {
+  return expansion("管理", {
     tile("Lua 皮肤更新", {
       icon = "system_update_alt",
       subtitle = "当前版本 v" .. LUA_SCRIPT_VERSION,
@@ -1900,6 +1950,10 @@ local function manage_section(ctx)
     tile("还原 AstrBot 数据", {
       icon = "restore", subtitle = "从备份文件恢复 data",
       trailing = button("还原", do_restore, { variant = "tonal" }),
+    }),
+    tile("删除离线包缓存", {
+      icon = "inventory_2_outlined", subtitle = "删除全部组件安装包缓存，释放存储空间",
+      trailing = button("清理", function() clear_offline_cache(ctx) end, { variant = "tonal" }),
     }),
     tile("清除 AstrBot 数据", {
       icon = "delete_outline", subtitle = "删除 data 数据目录 (不可恢复)",
@@ -1927,7 +1981,7 @@ app.page("home", function(ctx)
   }
   local opencode = opencode_card()
   if opencode then children[#children + 1] = opencode end
-  children[#children + 1] = env_card()
+  children[#children + 1] = env_card(ctx)
   children[#children + 1] = manage_section(ctx)
   children[#children + 1] =
     padding(text("Lua 皮肤 v" .. LUA_SCRIPT_VERSION, {

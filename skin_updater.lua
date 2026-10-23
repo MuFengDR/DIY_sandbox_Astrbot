@@ -15,7 +15,12 @@ local UPDATE_FILES = {
   "agent.lua",
   "installer.lua",
   "installer_bootstrap.lua",
+  "offline_packages.lua",
   "skin_updater.lua",
+  "assets/offline-installer.py",
+  "assets/bundled-component-installer.sh",
+  "assets/bootstrap-offline.tar.gz",
+  "assets/linuxqq.png",
   "agent/main.lua",
   "agent/sandbox",
 }

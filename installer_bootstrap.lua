@@ -1,9 +1,8 @@
--- Immutable bootstrap mirrored from the Bubble APK asset.
--- It is only responsible for fetching and verifying the signed installer.
+-- Bootstrap mirrored from the Bubble asset; supports the same offline engine.
 return [==[
 #!/usr/bin/env bash
 # Immutable bootstrap for the signed AstrBot Android shared installer.
-# It intentionally contains only update, verification, and migration logic.
+# Online installer verification plus APK-bundled offline preparation/dispatch.
 
 set -euo pipefail
 
@@ -70,19 +69,74 @@ resolve_github_proxy() {
   log 'No GitHub proxy responded; trying a direct connection.'
 }
 
-ensure_tools() {
-  local command
-  local missing=()
-  for command in curl openssl tar sha256sum base64; do
-    command -v "$command" >/dev/null 2>&1 || missing+=("$command")
-  done
-  [ "${#missing[@]}" -eq 0 ] && return 0
-
-  log "Installing bootstrap requirements: ${missing[*]}"
+ensure_tools() (
+  local command package update pending audit
+  local repair_required=0
   export DEBIAN_FRONTEND=noninteractive
+  # A killed apt/dpkg process leaves its journal or unpacked packages behind.
+  # Recover before the command-presence fast path: binaries may already exist
+  # even though their package configuration never completed.
+  pending=0
+  for update in /var/lib/dpkg/updates/*; do
+    [ -f "$update" ] || continue
+    [[ "${update##*/}" =~ ^[0-9]+$ ]] && pending=1
+  done
+  audit="$(dpkg --audit 2>/dev/null || true)"
+  if [ "$pending" -eq 1 ] || [ -n "$audit" ]; then
+    log '检测到上次软件包安装中断，正在修复 dpkg 状态…'
+    if ! dpkg --configure -a; then
+      # Missing dependencies can prevent configuration. The bundled debs below
+      # provide them; an offline apt repair must still be allowed to run.
+      repair_required=1
+      log '部分软件包尚未配置完成，将使用内置 deb 补齐并修复。'
+    fi
+  fi
+
+  local missing_packages=()
+  for command in curl openssl tar sha256sum base64 python3; do
+    command -v "$command" >/dev/null 2>&1 && continue
+    case "$command" in
+      sha256sum|base64) package="coreutils" ;;
+      *) package="$command" ;;
+    esac
+    [[ " ${missing_packages[*]} " == *" $package "* ]] || \
+      missing_packages+=("$package")
+  done
+  # The certificate bundle is what curl actually needs.
+  [ -s /etc/ssl/certs/ca-certificates.crt ] || \
+    missing_packages+=(ca-certificates)
+  if [ "${#missing_packages[@]}" -eq 0 ] && [ "$repair_required" -eq 0 ]; then
+    return 0
+  fi
+
+  log "Installing bootstrap requirements: ${missing_packages[*]}"
+  local bundled="/root/bootstrap-offline.tar.gz" stage
+  if [ -s "$bundled" ]; then
+    stage="$(mktemp -d /root/.bootstrap-offline.XXXXXX)"
+    trap 'rm -rf "$stage"' EXIT
+    tar -xzf "$bundled" -C "$stage"
+    # Real empty paths avoid apt's warnings about /dev/null and /etc/apt/-/.
+    mkdir -p "$stage/sources.list.d"
+    : > "$stage/sources.list"
+    if ! apt-get --no-download --fix-broken --no-remove \
+        -o "Dir::Etc::sourcelist=$stage/sources.list" \
+        -o "Dir::Etc::sourceparts=$stage/sources.list.d" \
+        -o "Dir::Cache::archives=$stage/debs" -o DPkg::Lock::Timeout=30 \
+        install -y "$stage"/debs/*.deb; then
+      fail '内置 bootstrap 离线资源安装失败，请查看终端日志后重试。'
+    fi
+    dpkg --configure -a || fail 'Bootstrap 软件包配置未完成，请保留终端日志后重试。'
+    for command in curl openssl tar sha256sum base64 python3; do
+      command -v "$command" >/dev/null || fail "Bootstrap is missing $command after offline preparation."
+    done
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || fail 'Bootstrap certificate bundle is missing.'
+    return 0
+  fi
+  log 'APK 缺少内置 bootstrap 离线资源，需要联网补齐工具；可取消并安装包含离线资源的新版 APK。'
+  [ "${ASTRBOT_OFFLINE:-0}" != 1 ] || fail '离线模式禁止下载 bootstrap 依赖。'
   apt-get -o Acquire::ForceIPv4=true update || true
-  apt-get -o Acquire::ForceIPv4=true install -y curl ca-certificates openssl tar coreutils
-}
+  apt-get -o Acquire::ForceIPv4=true install -y "${missing_packages[@]}"
+)
 
 write_public_key() {
   mkdir -p "$STATE_DIR"
@@ -303,17 +357,22 @@ check_update() (
 usage() {
   cat <<'EOF'
 Usage:
+  astrbot-installer-bootstrap.sh --prepare
   astrbot-installer-bootstrap.sh --ensure
   astrbot-installer-bootstrap.sh --check
   astrbot-installer-bootstrap.sh --update
   astrbot-installer-bootstrap.sh --import /path/to/offline-package.tar.gz
-  astrbot-installer-bootstrap.sh --run --step <base|uv|napcat|astrbot|opencode|all>
+  astrbot-installer-bootstrap.sh --run --step <base|uv|linuxqq|napcat|astrbot|opencode|all>
 EOF
 }
 
 main() {
   local command="${1:---help}"
   case "$command" in
+    --prepare)
+      ensure_tools
+      log 'Bootstrap requirements are ready.'
+      ;;
     --ensure|--check|--update)
       ensure_tools
       resolve_github_proxy
@@ -334,7 +393,13 @@ main() {
       ;;
     --run)
       shift
+      if [ "${ASTRBOT_OFFLINE:-0}" = 1 ]; then
+        exec python3 /root/offline-installer.py "$@"
+      fi
       require_installer
+      if [ "${1:-}" = --step ] && [ "${2:-}" = linuxqq ]; then
+        exec bash /root/bundled-component-installer.sh "$@"
+      fi
       exec "$CURRENT_SCRIPT" "$@"
       ;;
     --help|-h|help) usage ;;
@@ -343,4 +408,5 @@ main() {
 }
 
 main "$@"
+
 ]==]
