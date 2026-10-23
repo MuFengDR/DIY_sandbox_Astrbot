@@ -1,7 +1,7 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.1"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.2"
 
 -- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
@@ -156,6 +156,14 @@ local function dpkg_marker(ub, name)
     host.exists(base .. ":all.list")
 end
 
+local function linuxqq_files_installed(ub)
+  -- Android follows absolute symlinks outside the Ubuntu rootfs. The packaged
+  -- /usr/bin/qq -> /opt/QQ/qq link can therefore appear missing to host.exists.
+  local executable = host.exists(ub .. "/opt/QQ/qq") or
+    host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq")
+  return executable and dpkg_marker(ub, "linuxqq")
+end
+
 local function env_installed(step)
   local ub = host.ubuntu_path()
   if step == "base" then
@@ -163,13 +171,10 @@ local function env_installed(step)
   elseif step == "uv" then
     return host.exists(ub .. "/root/.local/bin/uv") and host.exists(ub .. "/root/.local/bin/uvx")
   elseif step == "linuxqq" then
-    return (host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq")) and
-      dpkg_marker(ub, "linuxqq")
+    return linuxqq_files_installed(ub)
   elseif step == "napcat" then
-    local qq = host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq") or
-      host.exists(ub .. "/opt/QQ/qq")
     local xvfb = host.exists(ub .. "/usr/bin/Xvfb") or host.exists(ub .. "/usr/local/bin/Xvfb")
-    return qq and xvfb and dpkg_marker(ub, "linuxqq") and dpkg_marker(ub, "libnss3") and
+    return linuxqq_files_installed(ub) and xvfb and dpkg_marker(ub, "libnss3") and
       dpkg_marker(ub, "libnspr4") and (dpkg_marker(ub, "libasound2t64") or dpkg_marker(ub, "libasound2")) and
       host.exists(ub .. "/root/launcher.sh") and host.exists(ub .. "/root/libnapcat_launcher.so") and
       host.exists(ub .. "/root/napcat")
@@ -239,6 +244,7 @@ local function run_installer_step(step, reinstall, reinstall_plugins, reinstall_
     host.toast("在线安装请先下载或更新脚本，也可以选择离线安装")
     return false
   end
+  local revision = state("environment.rev", 0)
   local started = installer.run(step, {
     reinstall = reinstall == true,
     reinstall_plugins = reinstall_plugins == true,
@@ -249,6 +255,7 @@ local function run_installer_step(step, reinstall, reinstall_plugins, reinstall_
     onebot_ws_port = ports.get("onebot"),
     title = STEP_TITLES[step] or "安装脚本",
     key = "installer-" .. step,
+    on_exit = function() revision.set(revision.get() + 1) end,
   })
   if started then host.nav.go(2) end
   return started
