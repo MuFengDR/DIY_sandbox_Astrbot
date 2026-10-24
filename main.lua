@@ -1567,13 +1567,32 @@ local function diag_plugin_names(pluginSet)
   return names
 end
 
-local function diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings)
+local function diag_model_selection(config)
+  -- New configs remove default_provider_id during migration. An empty new
+  -- selection must not fall back to a stale legacy model ID.
+  if type(config.agent_runner) == "table" then
+    local runner = config.agent_runner
+    local runnerType = tostring(runner.runner_type or "local")
+    local runnerConfig = type(runner.config) == "table" and runner.config or {}
+    local model = type(runnerConfig.model) == "table" and runnerConfig.model or {}
+    return tostring(model.provider_id or ""):match("^%s*(.-)%s*$"), runnerType ~= "local" and runnerType or ""
+  end
+  local settings = type(config.provider_settings) == "table" and config.provider_settings or {}
+  return tostring(settings.default_provider_id or ""):match("^%s*(.-)%s*$"), ""
+end
+
+local function diag_default_model_label(defaultId, defaultOk, externalRunner)
+  if externalRunner ~= "" then return "由 " .. externalRunner .. " 执行器管理" end
+  return defaultId ~= "" and (defaultId .. (defaultOk and "" or "（不可用）")) or "未配置"
+end
+
+local function diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings, externalRunner)
   local platform = type(cfg.data.platform_settings) == "table" and cfg.data.platform_settings or {}
   local proactive = type(settings.proactive_capability) == "table" and settings.proactive_capability or {}
   local active = type(settings.active_reply) == "table" and settings.active_reply or {}
   local whitelist = type(active.whitelist) == "table" and active.whitelist or {}
   local plugins = diag_plugin_names(cfg.data.plugin_set)
-  local defaultModel = defaultId ~= "" and (defaultId .. (defaultOk and "" or "（不可用）")) or "未配置"
+  local defaultModel = diag_default_model_label(defaultId, defaultOk, externalRunner)
   local lines = {
     "\t" .. diag_config_name(cfg.id) .. "：",
     "\t\t模型：" .. enabled .. "/" .. #providers,
@@ -1605,13 +1624,13 @@ local function diag_config_summary(configs)
   for _, cfg in ipairs(configs) do
     local providers = type(cfg.data.provider) == "table" and cfg.data.provider or {}
     local settings = type(cfg.data.provider_settings) == "table" and cfg.data.provider_settings or {}
-    local defaultId = tostring(settings.default_provider_id or "")
-    local enabled, defaultOk = 0, false
+    local defaultId, externalRunner = diag_model_selection(cfg.data)
+    local enabled, defaultOk = 0, externalRunner ~= ""
     for _, provider in ipairs(providers) do
       if type(provider) == "table" and provider.enable ~= false then enabled = enabled + 1 end
-      if type(provider) == "table" and tostring(provider.id or "") == defaultId and provider.enable ~= false then defaultOk = true end
+      if defaultId ~= "" and type(provider) == "table" and tostring(provider.id or "") == defaultId and provider.enable ~= false then defaultOk = true end
     end
-    if defaultId == "" or not defaultOk then bad = true end
+    if not defaultOk then bad = true end
     local admins = 0
     for _, id in ipairs(type(cfg.data.admins_id) == "table" and cfg.data.admins_id or {}) do
       if tostring(id) ~= "astrbot" then admins = admins + 1 end
@@ -1619,9 +1638,9 @@ local function diag_config_summary(configs)
     local wake = diag_first_non_empty(cfg.data.wake_prefix, cfg.data.wake_prefixes, settings.wake_prefix) or "未配置"
     local wakeDisplay = diag_value(wake)
     lines[#lines + 1] = diag_config_name(cfg.id) .. "：模型 " .. enabled .. "/" .. #providers ..
-      "，默认模型 " .. (defaultId ~= "" and defaultId or "未配置") ..
-      ((defaultId ~= "" and not defaultOk) and "（不可用）" or "") .. "，管理员 " .. admins .. "，唤醒词 " .. tostring(wakeDisplay)
-    reports[#reports + 1] = diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings)
+      "，默认模型 " .. diag_default_model_label(defaultId, defaultOk, externalRunner) ..
+      "，管理员 " .. admins .. "，唤醒词 " .. tostring(wakeDisplay)
+    reports[#reports + 1] = diag_config_report(cfg, providers, enabled, defaultId, defaultOk, admins, wake, settings, externalRunner)
   end
   return table.concat(lines, "\n"), bad, table.concat(reports, "\n\n")
 end
@@ -1664,8 +1683,12 @@ local function diag_test_models(index, rev, done)
     end
     index = index + 1
     local configName = diag_config_name(cfg.id)
-    local settings = type(cfg.data.provider_settings) == "table" and cfg.data.provider_settings or {}
-    local providerId = tostring(settings.default_provider_id or "")
+    local providerId, externalRunner = diag_model_selection(cfg.data)
+    if externalRunner ~= "" then
+      indeterminate = true
+      results[#results + 1] = configName .. "：使用 " .. externalRunner .. " 执行器，暂不支持自动测试"
+      next_model(); return
+    end
     if providerId == "" then failed = true; results[#results + 1] = configName .. "：未配置默认模型"; next_model(); return end
     tested = tested + 1
     diag.request = host.http({
