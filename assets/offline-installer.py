@@ -124,8 +124,9 @@ def dpkg_ready(package):
 
 def ready(component):
     if component == "base":
-        return all(shutil.which(x) for x in ("sudo", "git", "curl", "openssl", "Xvfb")) and all(
-            dpkg_ready(x) for x in ("libnss3", "libnspr4", "libgbm1", "libasound2t64"))
+        # Match the online base step and both UIs. QQ libraries belong to the
+        # QQ components, not to uv/AstrBot's prerequisite check.
+        return all(shutil.which(x) for x in ("sudo", "git", "curl"))
     if component == "uv":
         return all(os.access(HOME / ".local/bin" / x, os.X_OK) for x in ("uv", "uvx"))
     if component == "linuxqq":
@@ -133,10 +134,24 @@ def ready(component):
     return False
 
 
+def qq_runtime_missing(with_display=False):
+    missing = [name for name in ("libnss3", "libnspr4", "libgbm1") if not dpkg_ready(name)]
+    if not (dpkg_ready("libasound2t64") or dpkg_ready("libasound2")):
+        missing.append("libasound2t64/libasound2")
+    if with_display:
+        missing += [name for name in ("Xvfb", "xvfb-run") if not shutil.which(name)]
+    return missing
+
+
 def check_dependencies(component):
     missing = [x for x in DEPENDENCIES[component] if not ready(x)]
     if missing:
         raise ValueError("请先安装依赖组件：" + "、".join(missing))
+    if component in ("linuxqq", "napcat"):
+        missing = qq_runtime_missing(with_display=component == "napcat")
+        if missing:
+            raise ValueError("缺少 QQ 系统运行依赖：" + "、".join(missing)
+                             + "。在线基础命令仅安装 sudo/git/curl，请先离线安装基础环境包补齐依赖")
 
 
 def install_debs(files):
@@ -227,7 +242,14 @@ def install_files(root, component, journal):
             debs[0].rename(canonical)
             debs = [canonical]
         install_debs(debs)
-        if not ready(component):
+        if component == "base":
+            # A full offline base pack promises more than the online base step.
+            # Preserve that post-install validation without imposing it on uv.
+            missing = [name for name in ("sudo", "git", "curl", "openssl") if not shutil.which(name)]
+            missing += qq_runtime_missing(with_display=True)
+            if missing:
+                raise ValueError("基础环境包安装后仍缺少：" + "、".join(missing))
+        elif not ready(component):
             raise ValueError("安装后的组件检查失败：" + component)
         return
 

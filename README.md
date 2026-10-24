@@ -22,6 +22,8 @@ Linux 环境安装脚本由 [AstrBot-Android-Scripts](https://github.com/MuFengD
 
 建议顺序：基础环境 → uv → LinuxQQ → NapCat → AstrBot；AstrBot 仅依赖基础环境和 uv。先停止 AstrBot 和所有 NapCat 账号，把 `.tar.gz` / `.tgz` 组件包放到手机 Download 目录，在离线安装文件列表中选择，也可输入共享存储或 Ubuntu `/root/` 下的绝对路径。首次访问共享存储需授权，授权后点击刷新。
 
+在线“基础命令”安装后可直接离线安装 uv、AstrBot，不要求先具备 QQ 系统库。LinuxQQ、NapCat 会单独检查其系统运行依赖，缺少时列出具体缺项；先离线安装基础环境包补齐，再继续安装。在线、离线安装按实际文件和包状态识别依赖。
+
 离线安装不要求下载共享在线安装脚本。皮肤自带与泡泡版相同的可信安装引擎和 bootstrap 最小工具包，先在本地补齐工具，再验证组件包的完整性、类型、架构、依赖和目录结构。安装器不执行组件包内脚本，不访问 apt 网络源、GitHub 或 PyPI。Ubuntu rootfs 的首次解压继续由沙盒本体使用内置资源完成。
 
 bootstrap 工具安装被强制终止后，下一次离线安装会先修复 dpkg 中断状态，必要时使用内置 deb 补齐依赖，全程不需要联网。

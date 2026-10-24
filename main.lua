@@ -1,7 +1,7 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.2"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.3"
 
 -- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
