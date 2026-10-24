@@ -1,12 +1,14 @@
 {
     "format":  "astrbot-skin-update-v1",
-    "version":  "0.1.0-beta5.6.2",
+    "version":  "0.1.0-beta5.6.4",
     "files":  [
                   "agent.lua",
                   "agent/main.lua",
                   "agent/sandbox",
+                  "assets/__pycache__/offline-installer.cpython-311.pyc",
                   "assets/bootstrap-offline.tar.gz",
                   "assets/bundled-component-installer.sh",
+                  "assets/initialize-dashboard.py",
                   "assets/offline-installer.py",
                   "installer.lua",
                   "installer_bootstrap.lua",

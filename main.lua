@@ -1,7 +1,7 @@
 -- AstrBot Android 默认脚本 (位于 {configPath}/scripts/main.lua, 可直接编辑, 主页顶栏刷新键重载)
 -- API 详见同目录 AGENTS.md
 
-local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.3"
+local LUA_SCRIPT_VERSION = "0.1.0-beta5.6.4"
 
 -- 独立 agent 模块 (OpenCode 引擎启动/WebUI 托管), 界面在本文件编排
 local agent = require("agent")
@@ -161,21 +161,26 @@ local function linuxqq_files_installed(ub)
   -- /usr/bin/qq -> /opt/QQ/qq link can therefore appear missing to host.exists.
   local executable = host.exists(ub .. "/opt/QQ/qq") or
     host.exists(ub .. "/usr/bin/qq") or host.exists(ub .. "/usr/local/bin/qq")
-  return executable and dpkg_marker(ub, "linuxqq")
+  local runtime = dpkg_marker(ub, "libnss3") and dpkg_marker(ub, "libnspr4") and
+    dpkg_marker(ub, "libgbm1") and
+    (dpkg_marker(ub, "libasound2t64") or dpkg_marker(ub, "libasound2"))
+  return executable and dpkg_marker(ub, "linuxqq") and runtime
 end
 
 local function env_installed(step)
   local ub = host.ubuntu_path()
   if step == "base" then
-    return host.exists(ub .. "/usr/bin/git") and host.exists(ub .. "/usr/bin/curl") and host.exists(ub .. "/usr/bin/sudo")
+    return host.exists(ub .. "/usr/bin/git") and host.exists(ub .. "/usr/bin/curl") and
+      host.exists(ub .. "/usr/bin/sudo") and host.exists(ub .. "/usr/bin/tar") and
+      host.exists(ub .. "/etc/ssl/certs/ca-certificates.crt")
   elseif step == "uv" then
     return host.exists(ub .. "/root/.local/bin/uv") and host.exists(ub .. "/root/.local/bin/uvx")
   elseif step == "linuxqq" then
     return linuxqq_files_installed(ub)
   elseif step == "napcat" then
     local xvfb = host.exists(ub .. "/usr/bin/Xvfb") or host.exists(ub .. "/usr/local/bin/Xvfb")
-    return linuxqq_files_installed(ub) and xvfb and dpkg_marker(ub, "libnss3") and
-      dpkg_marker(ub, "libnspr4") and (dpkg_marker(ub, "libasound2t64") or dpkg_marker(ub, "libasound2")) and
+    local xvfb_run = host.exists(ub .. "/usr/bin/xvfb-run") or host.exists(ub .. "/usr/local/bin/xvfb-run")
+    return linuxqq_files_installed(ub) and xvfb and xvfb_run and
       host.exists(ub .. "/root/launcher.sh") and host.exists(ub .. "/root/libnapcat_launcher.so") and
       host.exists(ub .. "/root/napcat")
   elseif step == "astrbot" then
@@ -219,7 +224,7 @@ local function env_step_enabled(step, installed, script_ready)
 end
 
 local ENV_STEPS = {
-  { id = "base",    title = "基础命令", sub = "sudo / git / curl" },
+  { id = "base",    title = "基础命令", sub = "sudo / git / curl / tar" },
   { id = "uv",      title = "uv",       sub = "Python 依赖管理工具" },
   { id = "linuxqq", title = "LinuxQQ",  sub = "NapCat 所需的 ARM64 QQ 客户端" },
   { id = "napcat",  title = "NapCat",   sub = "安装或修复 NapCatQQ" },
@@ -473,7 +478,8 @@ local function astrbot_start_command()
     "export TMPDIR='" .. host.tmp_path() .. "'",
     "export ASTRBOT_DASHBOARD_PORT='" .. tostring(ports.get("dashboard")) .. "'",
     "if [ ! -x /root/.local/bin/uv ] || [ ! -d /root/AstrBot ] || [ ! -f /root/AstrBot/pyproject.toml ] || [ ! -f /root/AstrBot/main.py ] || [ ! -d /root/AstrBot/.venv ]; then echo 'AstrBot 环境未安装完整，请到主页环境管理安装。'; exit 1; fi",
-    "cd /root/AstrBot",
+    "cd /root/AstrBot || exit 1",
+    ".venv/bin/python /root/initialize-dashboard.py || exit 1",
     "echo 'AstrBot 启动中'",
     "/root/.local/bin/uv run --no-sync main.py",
   }, "; ")
@@ -483,6 +489,8 @@ function astrbot_toggle(running)
   if running then
     host.stop("astrbot")
   else
+    local ok, error_message = pcall(installer.ensure_dashboard_initializer)
+    if not ok then host.toast(tostring(error_message)); return end
     host.spawn(astrbot_start_command(), "AstrBot", "astrbot")
     host.nav.go(2)
   end

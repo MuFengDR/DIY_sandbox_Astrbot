@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $skinRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $assetRoot = Join-Path $skinRoot 'assets'
 New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
-foreach ($name in @('offline-installer.py', 'bootstrap-offline.tar.gz')) {
+foreach ($name in @('offline-installer.py', 'bootstrap-offline.tar.gz', 'initialize-dashboard.py')) {
     Copy-Item -LiteralPath (Join-Path $BubbleRoot "assets\$name") -Destination $assetRoot -Force
 }
 Copy-Item -LiteralPath (Join-Path $BubbleRoot 'assets\astrbot-startup.sh') -Destination (Join-Path $assetRoot 'bundled-component-installer.sh') -Force

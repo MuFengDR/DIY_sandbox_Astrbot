@@ -122,6 +122,17 @@ local function bootstrap_host_path()
   return host.ubuntu_path() .. "/root/astrbot-installer-bootstrap.sh"
 end
 
+function M.ensure_dashboard_initializer()
+  local root = host.ubuntu_path() .. "/root"
+  host.mkdirs(root)
+  local name = "initialize-dashboard.py"
+  local content = host.read_file(SCRIPTS .. "/assets/" .. name)
+  assert(content and content ~= "", "皮肤缺少资源 " .. name .. "，请重新导入完整皮肤包")
+  if host.read_file(root .. "/" .. name) ~= content then
+    assert(host.write_file(root .. "/" .. name, content), "无法写入 " .. name)
+  end
+end
+
 function M.ensure_bootstrap()
   local root = host.ubuntu_path() .. "/root"
   host.mkdirs(root)

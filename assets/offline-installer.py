@@ -94,8 +94,8 @@ def validate(root, component):
         raise ValueError("离线包依赖声明不正确")
     paths = {
         "base": ["debs"], "uv": ["uv/uv", "uv/uvx"],
-        "linuxqq": ["linuxqq.deb"],
-        "napcat": ["napcat/napcat.mjs", "launcher.sh", "libnapcat_launcher.so"],
+        "linuxqq": ["linuxqq.deb", "debs"],
+        "napcat": ["napcat/napcat.mjs", "launcher.sh", "libnapcat_launcher.so", "debs"],
         "astrbot": ["astrbot/main.py", "astrbot/pyproject.toml", "astrbot/uv.lock",
                     "python/bin/python3", "wheels", "requirements-offline.txt", "dashboard/index.html"],
     }
@@ -107,6 +107,10 @@ def validate(root, component):
             raise ValueError("离线包缺少文件：" + name)
     if component == "base" and not list((files / "debs").glob("*.deb")):
         raise ValueError("基础包中没有 deb 安装文件")
+    if component == "linuxqq" and not list((files / "debs").glob("*.deb")):
+        raise ValueError("LinuxQQ 包中没有运行依赖 deb")
+    if component == "napcat" and not list((files / "debs").glob("*.deb")):
+        raise ValueError("NapCat 包中没有 Xvfb 离线依赖")
     if component == "astrbot":
         if not list((files / "wheels").glob("*.whl")):
             raise ValueError("AstrBot 包缺少 Python wheel 依赖")
@@ -124,13 +128,12 @@ def dpkg_ready(package):
 
 def ready(component):
     if component == "base":
-        # Match the online base step and both UIs. QQ libraries belong to the
-        # QQ components, not to uv/AstrBot's prerequisite check.
-        return all(shutil.which(x) for x in ("sudo", "git", "curl"))
+        return all(shutil.which(x) for x in ("sudo", "git", "curl", "tar")) and (
+            Path("/etc/ssl/certs/ca-certificates.crt").is_file())
     if component == "uv":
         return all(os.access(HOME / ".local/bin" / x, os.X_OK) for x in ("uv", "uvx"))
     if component == "linuxqq":
-        return bool(shutil.which("qq")) and dpkg_ready("linuxqq")
+        return bool(shutil.which("qq")) and dpkg_ready("linuxqq") and not qq_runtime_missing()
     return False
 
 
@@ -147,13 +150,6 @@ def check_dependencies(component):
     missing = [x for x in DEPENDENCIES[component] if not ready(x)]
     if missing:
         raise ValueError("请先安装依赖组件：" + "、".join(missing))
-    if component in ("linuxqq", "napcat"):
-        missing = qq_runtime_missing(with_display=component == "napcat")
-        if missing:
-            raise ValueError("缺少 QQ 系统运行依赖：" + "、".join(missing)
-                             + "。在线基础命令仅安装 sudo/git/curl，请先离线安装基础环境包补齐依赖")
-
-
 def install_debs(files):
     for file in files:
         arch = subprocess.check_output(["dpkg-deb", "-f", file, "Architecture"], text=True).strip()
@@ -227,29 +223,32 @@ def clean_runtimes(component):
 def install_files(root, component, journal):
     files = root / "files"
     if component in ("base", "linuxqq"):
-        debs = sorted((files / "debs").glob("*.deb")) if component == "base" else [files / "linuxqq.deb"]
+        debs = sorted((files / "debs").glob("*.deb"))
         if component == "linuxqq":
-            name = subprocess.check_output(["dpkg-deb", "-f", debs[0], "Package"], text=True).strip()
+            linuxqq_deb = files / "linuxqq.deb"
+            name = subprocess.check_output(["dpkg-deb", "-f", linuxqq_deb, "Package"], text=True).strip()
             if name != "linuxqq":
                 raise ValueError("LinuxQQ 包内的 deb 不是 linuxqq")
-            version = subprocess.check_output(["dpkg-deb", "-f", debs[0], "Version"], text=True).strip()
-            arch = subprocess.check_output(["dpkg-deb", "-f", debs[0], "Architecture"], text=True).strip()
+            version = subprocess.check_output(["dpkg-deb", "-f", linuxqq_deb, "Version"], text=True).strip()
+            arch = subprocess.check_output(["dpkg-deb", "-f", linuxqq_deb, "Architecture"], text=True).strip()
             if arch != "arm64" or not re.fullmatch(r"[0-9][A-Za-z0-9.+:~\-]*", version):
                 raise ValueError("LinuxQQ deb 的架构或版本字段不正确")
-            # apt --no-download looks up the canonical archive basename even
-            # for a local argument. The pack deliberately uses linuxqq.deb.
-            canonical = files / ("linuxqq_" + version.replace(":", "%3a") + "_" + arch + ".deb")
-            debs[0].rename(canonical)
-            debs = [canonical]
+            # apt --no-download finds package archives by their canonical names.
+            canonical = files / "debs" / ("linuxqq_" + version.replace(":", "%3a") + "_" + arch + ".deb")
+            shutil.copy2(linuxqq_deb, canonical)
+            if canonical not in debs:
+                debs.append(canonical)
         install_debs(debs)
         if component == "base":
-            # A full offline base pack promises more than the online base step.
-            # Preserve that post-install validation without imposing it on uv.
-            missing = [name for name in ("sudo", "git", "curl", "openssl") if not shutil.which(name)]
-            missing += qq_runtime_missing(with_display=True)
+            missing = [name for name in ("sudo", "git", "curl", "tar") if not shutil.which(name)]
+            if not Path("/etc/ssl/certs/ca-certificates.crt").is_file():
+                missing.append("ca-certificates")
             if missing:
                 raise ValueError("基础环境包安装后仍缺少：" + "、".join(missing))
         elif not ready(component):
+            if component == "linuxqq":
+                missing = qq_runtime_missing()
+                raise ValueError("LinuxQQ 安装后仍缺少运行依赖：" + "、".join(missing or ["qq 命令或 dpkg 状态"]))
             raise ValueError("安装后的组件检查失败：" + component)
         return
 
@@ -268,6 +267,13 @@ def install_files(root, component, journal):
                 link.symlink_to(os.path.relpath(binary, HOME / ".local/bin"))
                 replacements.append((link, HOME / ".local/bin" / name))
         elif component == "napcat":
+            napcat_debs = sorted((files / "debs").glob("*.deb"))
+            if not napcat_debs:
+                raise ValueError("NapCat 包中没有 Xvfb 离线依赖")
+            install_debs(napcat_debs)
+            missing = [name for name in ("Xvfb", "xvfb-run") if not shutil.which(name)]
+            if missing:
+                raise ValueError("NapCat 包安装 Xvfb 依赖后仍缺少：" + "、".join(missing))
             shutil.copytree(files / "napcat", runtime / "napcat", symlinks=True)
             old_config = HOME / "napcat/config"
             if old_config.exists():
